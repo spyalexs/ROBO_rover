@@ -3,40 +3,50 @@
 ROS2 Launch file for ROBO Rover
 Launches the rover node with configurable parameters
 """
+#!/usr/bin/env python3
+"""
+ROS2 Launch file for ROBO Rover
+Launches the rover node with configurable parameters
+"""
 
+import os
+from launch.actions import DeclareLaunchArgument, LogInfo, TimerAction
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, LogInfo
-from launch.substitutions import LaunchConfiguration, TextSubstitution
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
 def generate_launch_description():
+    # Path to slam toolbox config
+    package_share_dir = get_package_share_directory('robo_rover')
+    slam_config = os.path.join(package_share_dir, 'config', 'mapper_params.yaml')
+
     # Declare launch arguments
     connection_string_arg = DeclareLaunchArgument(
         'connection_string',
         default_value='/dev/ttyACM1',
         description='MAVLink connection string (serial port or UDP/TCP)'
     )
-    
+
     baud_rate_arg = DeclareLaunchArgument(
         'baud_rate',
         default_value='115200',
         description='Baud rate for serial connection'
     )
 
-    
     control_frequency_arg = DeclareLaunchArgument(
         'control_frequency',
         default_value='20.0',
         description='Control command frequency in Hz'
     )
-    
+
     imu_frequency_arg = DeclareLaunchArgument(
         'imu_frequency',
         default_value='20.0',
         description='IMU data publishing frequency in Hz'
     )
-    
+
     namespace_arg = DeclareLaunchArgument(
         'namespace',
         default_value='',
@@ -45,7 +55,6 @@ def generate_launch_description():
     
     # Rover node
     rover_node = Node(
-        # package='robo_rover',
         executable='python3',
         arguments=['-m', 'robo_rover.rover_node'],
         name='rover_node',
@@ -58,13 +67,40 @@ def generate_launch_description():
             'control_frequency': LaunchConfiguration('control_frequency'),
             'imu_frequency': LaunchConfiguration('imu_frequency'),
         }],
-        remappings=[
-            # You can add topic remappings here if needed
-            # ('cmd_vel', 'rover/cmd_vel'),
-            # ('imu/data', 'rover/imu/data'),
-        ]
     )
-    
+    # Static TF node
+    static_tf_node = Node(
+    package='tf2_ros',
+    executable='static_transform_publisher',
+    name='base_link_to_laser',
+    arguments=[
+        '--x', '-0.0251', 
+        '--y', '0.0', 
+        '--z', '0.1683', 
+        '--yaw', '0', 
+        '--pitch', '0', 
+        '--roll', '0', 
+        '--frame-id', 'base_link', 
+        '--child-frame-id', 'laser'
+    ]
+    )
+    # SLAM Toolbox node
+    slam_toolbox_node = Node(
+        package='slam_toolbox',
+        executable='async_slam_toolbox_node',
+        name='slam_toolbox',
+        output='screen',
+        parameters=[slam_config],
+    )
+
+    delayed_slam = TimerAction(
+    period=5.0,
+    actions=[
+        LogInfo(msg='Starting slam_toolbox after 5 second delay'),
+        slam_toolbox_node
+    ]
+    )
+
     # Log info about the launch
     log_info = LogInfo(
         msg=[
@@ -73,20 +109,18 @@ def generate_launch_description():
             '  Baud Rate: ', LaunchConfiguration('baud_rate'), '\n',
             '  Control Frequency: ', LaunchConfiguration('control_frequency'), ' Hz\n',
             '  IMU Frequency: ', LaunchConfiguration('imu_frequency'), ' Hz\n',
+            '  SLAM config: ', slam_config, '\n',
         ]
     )
-    
+
     return LaunchDescription([
-        # Arguments
         connection_string_arg,
         baud_rate_arg,
         control_frequency_arg,
         imu_frequency_arg,
         namespace_arg,
-        
-        # Log launch info
         log_info,
-        
-        # Nodes
         rover_node,
+        static_tf_node,
+        delayed_slam,
     ])
