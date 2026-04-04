@@ -3,14 +3,9 @@
 ROS2 Launch file for ROBO Rover
 Launches the rover node with configurable parameters
 """
-#!/usr/bin/env python3
-"""
-ROS2 Launch file for ROBO Rover
-Launches the rover node with configurable parameters
-"""
 
 import os
-from launch.actions import DeclareLaunchArgument, LogInfo, TimerAction
+from launch.actions import DeclareLaunchArgument, LogInfo
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.substitutions import LaunchConfiguration
@@ -18,9 +13,7 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    # Path to slam toolbox config
     package_share_dir = get_package_share_directory('robo_rover')
-    slam_config = os.path.join(package_share_dir, 'config', 'mapper_params.yaml')
     urdf_file = os.path.join(package_share_dir, 'urdf', 'simple.urdf')
 
     with open(urdf_file, 'r') as f:
@@ -98,23 +91,6 @@ def generate_launch_description():
         '--child-frame-id', 'laser'
     ]
     )
-    # SLAM Toolbox node
-    slam_toolbox_node = Node(
-        package='slam_toolbox',
-        executable='async_slam_toolbox_node',
-        name='slam_toolbox',
-        output='screen',
-        parameters=[slam_config],
-    )
-
-    delayed_slam = TimerAction(
-    period=5.0,
-    actions=[
-        LogInfo(msg='Starting slam_toolbox after 5 second delay'),
-        slam_toolbox_node
-    ]
-    )
-
     # Log info about the launch
     log_info = LogInfo(
         msg=[
@@ -123,7 +99,6 @@ def generate_launch_description():
             '  Baud Rate: ', LaunchConfiguration('baud_rate'), '\n',
             '  Control Frequency: ', LaunchConfiguration('control_frequency'), ' Hz\n',
             '  IMU Frequency: ', LaunchConfiguration('imu_frequency'), ' Hz\n',
-            '  SLAM config: ', slam_config, '\n',
         ]
     )
 
@@ -136,6 +111,5 @@ def generate_launch_description():
         log_info,
         rover_node,
         static_tf_node,
-        delayed_slam,
         robot_state_publisher_node,
     ])
