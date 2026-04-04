@@ -21,6 +21,20 @@ def generate_launch_description():
     # Path to slam toolbox config
     package_share_dir = get_package_share_directory('robo_rover')
     slam_config = os.path.join(package_share_dir, 'config', 'mapper_params.yaml')
+    urdf_file = os.path.join(package_share_dir, 'urdf', 'simple.urdf')
+
+    with open(urdf_file, 'r') as f:
+        robot_description_content = f.read()
+
+    robot_state_publisher_node = Node(
+        package='robot_state_publisher',
+        executable='robot_state_publisher',
+        name='robot_state_publisher',
+        output='screen',
+        parameters=[{
+            'robot_description': robot_description_content
+        }],
+    )
 
     # Declare launch arguments
     connection_string_arg = DeclareLaunchArgument(
@@ -123,4 +137,5 @@ def generate_launch_description():
         rover_node,
         static_tf_node,
         delayed_slam,
+        robot_state_publisher_node,
     ])

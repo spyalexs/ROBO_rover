@@ -33,6 +33,11 @@ class ArduPilotRoverNode(Node):
         self.declare_parameter('odom_frame', 'odom')
         self.declare_parameter('base_frame', 'base_link')
 
+        # Gyro/odom tuning parameters
+        self.declare_parameter('gyro_cal_duration', 3.0)       # seconds, keep robot still at startup
+        self.declare_parameter('imu_stale_timeout', 0.20)      # seconds
+        self.declare_parameter('debug_gyro_yaw', False)
+
         # Get parameters
         self.connection_string = self.get_parameter('connection_string').value
         self.baud_rate = self.get_parameter('baud_rate').value
@@ -43,13 +48,17 @@ class ArduPilotRoverNode(Node):
         self.odom_frame = self.get_parameter('odom_frame').value
         self.base_frame = self.get_parameter('base_frame').value
 
+        self.gyro_cal_duration = float(self.get_parameter('gyro_cal_duration').value)
+        self.imu_stale_timeout = float(self.get_parameter('imu_stale_timeout').value)
+        self.debug_gyro_yaw = bool(self.get_parameter('debug_gyro_yaw').value)
+
         # Control variables
         self.default_throttle = 0.0
         self.default_steering = 0.0
         self.current_throttle = self.default_throttle
         self.current_steering = self.default_steering
-        self.last_cmd_time = time.time()
         self.last_cmd_linear = 0.0
+        self.last_cmd_time_ros = self.get_clock().now()
 
         # Connection variables
         self.master = None
@@ -58,6 +67,7 @@ class ArduPilotRoverNode(Node):
 
         # Cached MAVLink messages
         self.latest_scaled_imu = None
+        self.latest_scaled_imu_ros_time = None
         self.latest_attitude = None
         self.latest_vfr_hud = None
         self.latest_heartbeat = None
@@ -69,6 +79,14 @@ class ArduPilotRoverNode(Node):
         self.last_odom_update_time = None
         self.last_yaw_ros = 0.0
         self.last_groundspeed = 0.0
+
+        # Gyro-integrated yaw state
+        self.gyro_bias_z = 0.0         # rad/s
+        self.gyro_bias_sum = 0.0
+        self.gyro_bias_count = 0
+        self.gyro_bias_ready = False
+        self.gyro_cal_start_time = None
+        self.yaw_initialized = False
 
         # QoS profiles
         sensor_qos = QoSProfile(
@@ -115,6 +133,10 @@ class ArduPilotRoverNode(Node):
         # Initialize connection
         self.get_logger().info('Initializing ArduPilot Rover Node...')
         self.connect_to_rover()
+
+    @staticmethod
+    def wrap_pi(angle):
+        return math.atan2(math.sin(angle), math.cos(angle))
 
     def connect_to_rover(self):
         """Connect to the rover via MAVLink"""
@@ -283,8 +305,8 @@ class ArduPilotRoverNode(Node):
 
         self.current_throttle = int(np.clip(throttle_with_offset, -300, 300))
         self.current_steering = int(np.clip(msg.angular.z * 500, -1000, 1000))
-        self.last_cmd_linear = msg.linear.x
-        self.last_cmd_time = time.time()
+        self.last_cmd_linear = float(msg.linear.x)
+        self.last_cmd_time_ros = self.get_clock().now()
 
         self.get_logger().debug(
             f'Received cmd_vel: throttle={self.current_throttle}, '
@@ -306,6 +328,7 @@ class ArduPilotRoverNode(Node):
 
                 if msg_type == 'SCALED_IMU':
                     self.latest_scaled_imu = msg
+                    self.latest_scaled_imu_ros_time = self.get_clock().now()
                 elif msg_type == 'ATTITUDE':
                     self.latest_attitude = msg
                 elif msg_type == 'VFR_HUD':
@@ -322,7 +345,10 @@ class ArduPilotRoverNode(Node):
         if not self.connected or not self.armed:
             return
 
-        if time.time() - self.last_cmd_time > self.cmd_timeout:
+        now = self.get_clock().now()
+        cmd_age = (now - self.last_cmd_time_ros).nanoseconds / 1e9
+
+        if cmd_age > self.cmd_timeout:
             throttle = int(self.default_throttle * 1000)
             steering = int(self.default_steering * 1000)
         else:
@@ -362,127 +388,175 @@ class ArduPilotRoverNode(Node):
         self.accel_pub.publish(accel_msg)
 
     def odom_loop(self):
-        """Publish dead-reckoned odometry from ATTITUDE + VFR_HUD"""
+        """Publish dead-reckoned odometry using integrated SCALED_IMU z-gyro + commanded speed"""
         if not self.connected:
             return
 
-        if self.latest_attitude is None:
+        if self.latest_scaled_imu is None:
             return
 
-        try:
-            now_sec = time.time()
-            if self.last_odom_update_time is None:
-                self.last_odom_update_time = now_sec
+        now = self.get_clock().now()
+
+        # Initialize timers
+        if self.last_odom_update_time is None:
+            self.last_odom_update_time = now
+            self.gyro_cal_start_time = now
+            return
+
+        dt = (now - self.last_odom_update_time).nanoseconds / 1e9
+        self.last_odom_update_time = now
+
+        if dt <= 0.0 or dt > 1.0:
+            return
+
+        # Reject very stale IMU data
+        if self.latest_scaled_imu_ros_time is None:
+            return
+
+        imu_age = (now - self.latest_scaled_imu_ros_time).nanoseconds / 1e9
+        if imu_age > self.imu_stale_timeout:
+            self.get_logger().warn(
+                f'SCALED_IMU stale ({imu_age:.3f}s old); skipping odom update once'
+            )
+            return
+
+        # SCALED_IMU zgyro is in mrad/s -> rad/s
+        wz_meas = float(self.latest_scaled_imu.zgyro) / 1000.0
+
+        # -----------------------------
+        # Startup gyro bias calibration
+        # Keep robot still for a few seconds after launch
+        # -----------------------------
+        if not self.gyro_bias_ready:
+            elapsed = (now - self.gyro_cal_start_time).nanoseconds / 1e9
+
+            if elapsed < self.gyro_cal_duration:
+                self.gyro_bias_sum += wz_meas
+                self.gyro_bias_count += 1
+
+                if not self.yaw_initialized:
+                    self.last_yaw_ros = 0.0
+                    self.yaw_initialized = True
+
+                self.get_logger().info(
+                    f'Calibrating gyro bias... keep robot still '
+                    f'({elapsed:.1f}/{self.gyro_cal_duration:.1f}s)'
+                )
                 return
 
-            dt = now_sec - self.last_odom_update_time
-            self.last_odom_update_time = now_sec
+            if self.gyro_bias_count > 0:
+                self.gyro_bias_z = self.gyro_bias_sum / self.gyro_bias_count
+            else:
+                self.gyro_bias_z = 0.0
 
-            if dt <= 0.0 or dt > 1.0:
-                return
-
-            # ATTITUDE yaw from autopilot
-            # ATTITUDE yaw from autopilot
-            yaw_raw = float(self.latest_attitude.yaw)
-
-            yaw_ros_current = (math.pi / 2.0) - yaw_raw
-            yaw_ros_current = math.atan2(math.sin(yaw_ros_current), math.cos(yaw_ros_current))
-
-            yaw_ros_neg = -yaw_raw
-            yaw_ros_neg = math.atan2(math.sin(yaw_ros_neg), math.cos(yaw_ros_neg))
-
-            yaw_ros_identity = math.atan2(math.sin(yaw_raw), math.cos(yaw_raw))
-
-            groundspeed_dbg = float(self.latest_vfr_hud.groundspeed)
+            self.gyro_bias_ready = True
+            self.last_yaw_ros = 0.0
+            self.yaw_initialized = True
 
             self.get_logger().info(
-                f"yaw_raw={math.degrees(yaw_raw):7.2f} deg | "
-                f"curr(pi/2-raw)={math.degrees(yaw_ros_current):7.2f} deg | "
-                f"neg(-raw)={math.degrees(yaw_ros_neg):7.2f} deg | "
-                f"id(raw)={math.degrees(yaw_ros_identity):7.2f} deg | "
-                f"gs={groundspeed_dbg:5.2f}"
+                f'Gyro bias calibration done: '
+                f'{self.gyro_bias_z:.6f} rad/s ({math.degrees(self.gyro_bias_z):.4f} deg/s)'
+            )
+            return
+
+        # -----------------------------
+        # Integrate gyro z to get yaw
+        # -----------------------------
+        wz_unbiased = wz_meas - self.gyro_bias_z
+
+        # Based on your test:
+        # right turn -> integrated yaw went positive
+        # left turn  -> integrated yaw went negative
+        # For ROS yaw, we want left positive and right negative, so flip sign here.
+        delta_yaw = -(wz_unbiased * dt)
+
+        yaw_old = self.last_yaw_ros
+        yaw_mid = self.wrap_pi(yaw_old + 0.5 * delta_yaw)
+        yaw_new = self.wrap_pi(yaw_old + delta_yaw)
+
+        # Commanded linear velocity as forward speed proxy
+        cmd_age = (now - self.last_cmd_time_ros).nanoseconds / 1e9
+        if cmd_age > self.cmd_timeout:
+            groundspeed = 0.0
+        else:
+            groundspeed = float(self.last_cmd_linear)
+
+        # Midpoint integration for Ackermann-like arcs
+        self.odom_x += groundspeed * math.cos(yaw_mid) * dt
+        self.odom_y += groundspeed * math.sin(yaw_mid) * dt
+
+        self.last_yaw_ros = yaw_new
+        self.last_groundspeed = groundspeed
+
+        if self.debug_gyro_yaw:
+            self.get_logger().info(
+                f'yaw={math.degrees(yaw_new):7.2f} deg | '
+                f'delta={math.degrees(delta_yaw):7.2f} deg | '
+                f'wz={math.degrees(wz_unbiased):7.2f} deg/s | '
+                f'cmd_v={groundspeed:5.2f}'
             )
 
-            # Keep using your current conversion for now
-            yaw_ros = yaw_ros_current
+        quat = Rotation.from_euler('xyz', [0.0, 0.0, yaw_new]).as_quat()
+        stamp = now.to_msg()
 
-            if time.time() - self.last_cmd_time > self.cmd_timeout:
-                groundspeed = 0.0
-            else:
-                groundspeed = float(self.last_cmd_linear)
+        odom_msg = Odometry()
+        odom_msg.header.stamp = stamp
+        odom_msg.header.frame_id = self.odom_frame
+        odom_msg.child_frame_id = self.base_frame
 
-            self.odom_x += groundspeed * math.cos(yaw_ros) * dt
-            self.odom_y += groundspeed * math.sin(yaw_ros) * dt
-            self.last_yaw_ros = yaw_ros
-            self.last_groundspeed = groundspeed
+        odom_msg.pose.pose.position.x = self.odom_x
+        odom_msg.pose.pose.position.y = self.odom_y
+        odom_msg.pose.pose.position.z = 0.0
 
-            quat = Rotation.from_euler('xyz', [0.0, 0.0, yaw_ros]).as_quat()
-            stamp = self.get_clock().now().to_msg()
+        odom_msg.pose.pose.orientation.x = float(quat[0])
+        odom_msg.pose.pose.orientation.y = float(quat[1])
+        odom_msg.pose.pose.orientation.z = float(quat[2])
+        odom_msg.pose.pose.orientation.w = float(quat[3])
 
-            odom_msg = Odometry()
-            odom_msg.header.stamp = stamp
-            odom_msg.header.frame_id = self.odom_frame
-            odom_msg.child_frame_id = self.base_frame
+        odom_msg.twist.twist.linear.x = groundspeed
+        odom_msg.twist.twist.linear.y = 0.0
+        odom_msg.twist.twist.linear.z = 0.0
 
-            odom_msg.pose.pose.position.x = self.odom_x
-            odom_msg.pose.pose.position.y = self.odom_y
-            odom_msg.pose.pose.position.z = 0.0
+        odom_msg.twist.twist.angular.x = 0.0
+        odom_msg.twist.twist.angular.y = 0.0
+        odom_msg.twist.twist.angular.z = delta_yaw / dt if dt > 0.0 else 0.0
 
-            odom_msg.pose.pose.orientation.x = float(quat[0])
-            odom_msg.pose.pose.orientation.y = float(quat[1])
-            odom_msg.pose.pose.orientation.z = float(quat[2])
-            odom_msg.pose.pose.orientation.w = float(quat[3])
+        # Covariances: planar rover, approximate dead reckoning
+        odom_msg.pose.covariance = [
+            0.15, 0.0,  0.0,    0.0,    0.0,    0.0,
+            0.0,  0.15, 0.0,    0.0,    0.0,    0.0,
+            0.0,  0.0,  9999.0, 0.0,    0.0,    0.0,
+            0.0,  0.0,  0.0,    9999.0, 0.0,    0.0,
+            0.0,  0.0,  0.0,    0.0,    9999.0, 0.0,
+            0.0,  0.0,  0.0,    0.0,    0.0,    0.4
+        ]
 
-            odom_msg.twist.twist.linear.x = groundspeed
-            odom_msg.twist.twist.linear.y = 0.0
-            odom_msg.twist.twist.linear.z = 0.0
+        odom_msg.twist.covariance = [
+            0.20, 0.0,  0.0,    0.0,    0.0,    0.0,
+            0.0,  0.20, 0.0,    0.0,    0.0,    0.0,
+            0.0,  0.0,  9999.0, 0.0,    0.0,    0.0,
+            0.0,  0.0,  0.0,    9999.0, 0.0,    0.0,
+            0.0,  0.0,  0.0,    0.0,    9999.0, 0.0,
+            0.0,  0.0,  0.0,    0.0,    0.0,    0.3
+        ]
 
-            odom_msg.twist.twist.angular.x = 0.0
-            odom_msg.twist.twist.angular.y = 0.0
+        self.odom_pub.publish(odom_msg)
 
-            # Some pymavlink ATTITUDE objects may not expose yawspeed reliably
-            yaw_rate = getattr(self.latest_attitude, 'yawspeed', 0.0)
-            odom_msg.twist.twist.angular.z = -float(yaw_rate)
+        tf_msg = TransformStamped()
+        tf_msg.header.stamp = stamp
+        tf_msg.header.frame_id = self.odom_frame
+        tf_msg.child_frame_id = self.base_frame
 
-            odom_msg.pose.covariance = [
-                0.05, 0.0,  0.0,  0.0,  0.0,  0.0,
-                0.0,  0.05, 0.0,  0.0,  0.0,  0.0,
-                0.0,  0.0,  9999.0, 0.0,  0.0,  0.0,
-                0.0,  0.0,  0.0,  9999.0, 0.0,  0.0,
-                0.0,  0.0,  0.0,  0.0,  9999.0, 0.0,
-                0.0,  0.0,  0.0,  0.0,  0.0,  0.1
-            ]
+        tf_msg.transform.translation.x = self.odom_x
+        tf_msg.transform.translation.y = self.odom_y
+        tf_msg.transform.translation.z = 0.0
 
-            odom_msg.twist.covariance = [
-                0.1,  0.0,  0.0,  0.0,  0.0,  0.0,
-                0.0,  0.1,  0.0,  0.0,  0.0,  0.0,
-                0.0,  0.0,  9999.0, 0.0,  0.0,  0.0,
-                0.0,  0.0,  0.0,  9999.0, 0.0,  0.0,
-                0.0,  0.0,  0.0,  0.0,  9999.0, 0.0,
-                0.0,  0.0,  0.0,  0.0,  0.0,  0.2
-            ]
+        tf_msg.transform.rotation.x = float(quat[0])
+        tf_msg.transform.rotation.y = float(quat[1])
+        tf_msg.transform.rotation.z = float(quat[2])
+        tf_msg.transform.rotation.w = float(quat[3])
 
-            self.odom_pub.publish(odom_msg)
-
-            tf_msg = TransformStamped()
-            tf_msg.header.stamp = stamp
-            tf_msg.header.frame_id = self.odom_frame
-            tf_msg.child_frame_id = self.base_frame
-
-            tf_msg.transform.translation.x = self.odom_x
-            tf_msg.transform.translation.y = self.odom_y
-            tf_msg.transform.translation.z = 0.0
-
-            tf_msg.transform.rotation.x = float(quat[0])
-            tf_msg.transform.rotation.y = float(quat[1])
-            tf_msg.transform.rotation.z = float(quat[2])
-            tf_msg.transform.rotation.w = float(quat[3])
-
-            self.tf_broadcaster.sendTransform(tf_msg)
-
-        except Exception as e:
-            self.get_logger().error(f'odom_loop failed: {repr(e)}')
-            raise
+        self.tf_broadcaster.sendTransform(tf_msg)
 
     def status_loop(self):
         """Publish status information"""
