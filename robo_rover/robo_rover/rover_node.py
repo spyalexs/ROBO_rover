@@ -295,6 +295,8 @@ class ArduPilotRoverNode(Node):
             self.set_servo_pwm(STEER_SERVO, steering)
             self.set_servo_pwm(DRIVE_SERVO, throttle)
 
+            print(f"Setting drive servo to {throttle}")
+
         else:
             #run acro
             # Check for command timeout
