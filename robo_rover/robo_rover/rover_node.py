@@ -106,7 +106,7 @@ class ArduPilotRoverNode(Node):
             self.connected = True
             
             # Set mode to ACRO
-            if self.set_mode('ACRO'):
+            if self.set_mode('MODE'):
                 time.sleep(2)
                 # Arm the rover
                 self.arm_rover()
@@ -231,8 +231,8 @@ class ArduPilotRoverNode(Node):
         # msg.angular.z: turning rate (-2.0 to 2.0)
         
         # adds offset to throttle to make it act more linear
-        throttle_raw = msg.linear.x * -400
-        offset = 80
+        offset = 0
+        throttle_raw = msg.linear.x * -(1000 - offset)
 
         if throttle_raw >= 0:
             throttle_with_offset = throttle_raw + offset
