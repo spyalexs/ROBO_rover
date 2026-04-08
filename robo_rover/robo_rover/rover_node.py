@@ -255,6 +255,8 @@ class ArduPilotRoverNode(Node):
             self.current_throttle = msg.linear.x
             self.current_steering = msg.angular.z
 
+            self.last_cmd_time = time.time()
+
             return
             
         # adds offset to throttle to make it act more linear
