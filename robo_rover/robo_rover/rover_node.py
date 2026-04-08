@@ -106,7 +106,7 @@ class ArduPilotRoverNode(Node):
             self.connected = True
             
             # Set mode to ACRO
-            if self.set_mode('MANUAL'):
+            if self.set_mode('ACRO'):
                 time.sleep(2)
                 # Arm the rover
                 self.arm_rover()
