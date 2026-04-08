@@ -17,6 +17,10 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 from geometry_msgs.msg import Vector3
 
+STEER_SERVO = 4
+DRIVE_SERVO = 3
+NEUTRAL_PWM = 1500
+
 class ArduPilotRoverNode(Node):
     def __init__(self):
         super().__init__('rover_node')
@@ -26,12 +30,14 @@ class ArduPilotRoverNode(Node):
         self.declare_parameter('baud_rate', 115200)
         self.declare_parameter('control_frequency', 20.0)
         self.declare_parameter('imu_frequency', 20.0)
+        self.declare_parameter('manual_mode', True)
         
         # Get parameters
         self.connection_string = self.get_parameter('connection_string').value
         self.baud_rate = self.get_parameter('baud_rate').value
         self.control_freq = self.get_parameter('control_frequency').value
         self.imu_freq = self.get_parameter('imu_frequency').value
+        self.is_manual = self.get_parameter('manual_mode').value
         
         # Control variables
         self.default_throttle = 0.0
@@ -105,8 +111,16 @@ class ArduPilotRoverNode(Node):
             
             self.connected = True
             
+            desired_mode = "ACRO"
+            if(self.is_manual):
+                desired_mode = "MANUAL"
+                self.get_logger().warn("Must move steering servo into servo slot 4!")
+            else:
+                self.get_logger().warn("Must move steering servo into servo slot 2!")
+
+
             # Set mode to ACRO
-            if self.set_mode('ACRO'):
+            if self.set_mode(desired_mode):
                 time.sleep(2)
                 # Arm the rover
                 self.arm_rover()
@@ -230,9 +244,20 @@ class ArduPilotRoverNode(Node):
         # msg.linear.x: forward/backward speed (-1.0 to 1.0)
         # msg.angular.z: turning rate (-2.0 to 2.0)
         
+        if(self.is_manual):
+
+            #safety first
+            if(msg.linear.x < 1000) or (msg.linear.x > 2000):
+                self.current_throttle = NEUTRAL_PWM
+            if(msg.angular.z < 1000) or (msg.angular.z > 2000):
+                self.current_steering = NEUTRAL_PWM
+
+            self.current_throttle = msg.linear.x
+            self.current_steering = msg.angular.z
+            
         # adds offset to throttle to make it act more linear
-        offset = 0
-        throttle_raw = msg.linear.x * -(1000 - offset)
+        throttle_raw = msg.linear.x * -400
+        offset = 80
 
         if throttle_raw >= 0:
             throttle_with_offset = throttle_raw + offset
@@ -256,27 +281,43 @@ class ArduPilotRoverNode(Node):
         if not self.connected or not self.armed:
             return
         
-        # Check for command timeout
-        if time.time() - self.last_cmd_time > self.cmd_timeout:
-            # Use default values if no recent commands
-            throttle = int(self.default_throttle * 1000)
-            steering = int(self.default_steering * 1000)
+        if self.is_manual:
+
+            if time.time() - self.last_cmd_time > self.cmd_timeout:
+                # Use default values if no recent commands
+                throttle = NEUTRAL_PWM
+                steering = NEUTRAL_PWM
+            else:
+                throttle = self.current_throttle
+                steering = self.current_steering
+
+
+            self.set_servo_pwm(STEER_SERVO, steering)
+            self.set_servo_pwm(DRIVE_SERVO, throttle)
+
         else:
-            throttle = self.current_throttle
-            steering = self.current_steering
-        
-        # Send manual control command
-        try:
-            self.master.mav.manual_control_send(
-                self.master.target_system,
-                0,      
-                steering,    
-                throttle,      
-                0,           
-                0            
-            )
-        except Exception as e:
-            self.get_logger().error(f'Failed to send control command: {e}')
+            #run acro
+            # Check for command timeout
+            if time.time() - self.last_cmd_time > self.cmd_timeout:
+                # Use default values if no recent commands
+                throttle = int(self.default_throttle * 1000)
+                steering = int(self.default_steering * 1000)
+            else:
+                throttle = self.current_throttle
+                steering = self.current_steering
+            
+            # Send manual control command
+            try:
+                self.master.mav.manual_control_send(
+                    self.master.target_system,
+                    0,      
+                    steering,    
+                    throttle,      
+                    0,           
+                    0            
+                )
+            except Exception as e:
+                self.get_logger().error(f'Failed to send control command: {e}')
     
     def imu_loop(self):
         """IMU data processing loop"""
@@ -339,6 +380,14 @@ class ArduPilotRoverNode(Node):
             self.master.close()
         
         super().destroy_node()
+
+    def set_servo_pwm(self, servo, pwm):
+                    
+        self.master.mav.command_long_send(
+            self.master.target_system, self.master.target_component,
+            mavutil.mavlink.MAV_CMD_DO_SET_SERVO, 0,
+            servo, pwm, 0, 0, 0, 0, 0
+        )
 
 
 def main(args=None):
