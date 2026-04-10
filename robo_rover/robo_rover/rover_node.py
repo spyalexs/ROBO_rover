@@ -421,9 +421,6 @@ class ArduPilotRoverNode(Node):
             msg = Twist()
             msg.linear.x = self.current_ol_velocity
 
-            print(self.current_ol_velocity)
-            print(self.get_turn_radius_ol())
-
             msg.angular.z = float(self.current_ol_velocity) / float(self.get_turn_radius_ol())
 
             self.ol_rate_pub.publish(msg) 
