@@ -5,10 +5,15 @@ Combines steering/throttle control, IMU publishing, and odometry publishing
 """
 
 import math
+import os
 import time
+from math import exp
+from types import SimpleNamespace
 
 import numpy as np
 import rclpy
+import yaml
+from ament_index_python import get_package_share_directory
 from geometry_msgs.msg import TransformStamped, Twist, Vector3
 from nav_msgs.msg import Odometry
 from pymavlink import mavutil
@@ -17,6 +22,14 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from scipy.spatial.transform import Rotation
 from std_msgs.msg import Bool
 from tf2_ros import TransformBroadcaster
+
+STEER_SERVO = 4
+DRIVE_SERVO = 3
+PWM_MAX = 2000
+NEUTRAL_PWM = 1500
+PWM_MIN = 1000
+
+OL_MODEL_SUBPATH = "resource/ol_data.yaml"
 
 
 class ArduPilotRoverNode(Node):
@@ -28,14 +41,14 @@ class ArduPilotRoverNode(Node):
         self.declare_parameter('baud_rate', 115200)
         self.declare_parameter('control_frequency', 20.0)
         self.declare_parameter('imu_frequency', 20.0)
+        self.declare_parameter('manual_mode', True)
+        self.declare_parameter('ol_rate_mapping', True)
         self.declare_parameter('odom_frequency', 20.0)
         self.declare_parameter('cmd_timeout', 1.0)
         self.declare_parameter('odom_frame', 'odom')
         self.declare_parameter('base_frame', 'base_link')
-
-        # Gyro/odom tuning parameters
-        self.declare_parameter('gyro_cal_duration', 3.0)       # seconds, keep robot still at startup
-        self.declare_parameter('imu_stale_timeout', 0.20)      # seconds
+        self.declare_parameter('gyro_cal_duration', 3.0)
+        self.declare_parameter('imu_stale_timeout', 0.20)
         self.declare_parameter('debug_gyro_yaw', False)
 
         # Get parameters
@@ -43,11 +56,12 @@ class ArduPilotRoverNode(Node):
         self.baud_rate = self.get_parameter('baud_rate').value
         self.control_freq = float(self.get_parameter('control_frequency').value)
         self.imu_freq = float(self.get_parameter('imu_frequency').value)
+        self.is_manual = self.get_parameter('manual_mode').value
+        self.manaual_rate_mapping = self.get_parameter('ol_rate_mapping').value
         self.odom_freq = float(self.get_parameter('odom_frequency').value)
         self.cmd_timeout = float(self.get_parameter('cmd_timeout').value)
         self.odom_frame = self.get_parameter('odom_frame').value
         self.base_frame = self.get_parameter('base_frame').value
-
         self.gyro_cal_duration = float(self.get_parameter('gyro_cal_duration').value)
         self.imu_stale_timeout = float(self.get_parameter('imu_stale_timeout').value)
         self.debug_gyro_yaw = bool(self.get_parameter('debug_gyro_yaw').value)
@@ -57,8 +71,9 @@ class ArduPilotRoverNode(Node):
         self.default_steering = 0.0
         self.current_throttle = self.default_throttle
         self.current_steering = self.default_steering
-        self.last_cmd_linear = 0.0
+        self.last_cmd_time = time.time()
         self.last_cmd_time_ros = self.get_clock().now()
+        self.last_cmd_linear = 0.0
 
         # Connection variables
         self.master = None
@@ -68,8 +83,6 @@ class ArduPilotRoverNode(Node):
         # Cached MAVLink messages
         self.latest_scaled_imu = None
         self.latest_scaled_imu_ros_time = None
-        self.latest_attitude = None
-        self.latest_vfr_hud = None
         self.latest_heartbeat = None
 
         # Dead-reckoned odom state
@@ -81,7 +94,7 @@ class ArduPilotRoverNode(Node):
         self.last_groundspeed = 0.0
 
         # Gyro-integrated yaw state
-        self.gyro_bias_z = 0.0         # rad/s
+        self.gyro_bias_z = 0.0
         self.gyro_bias_sum = 0.0
         self.gyro_bias_count = 0
         self.gyro_bias_ready = False
@@ -104,6 +117,7 @@ class ArduPilotRoverNode(Node):
         # Publishers
         self.gyro_pub = self.create_publisher(Vector3, 'imu/gyro', sensor_qos)
         self.accel_pub = self.create_publisher(Vector3, 'imu/accel', sensor_qos)
+        self.ol_rate_pub = self.create_publisher(Twist, 'ol_rates', sensor_qos)
         self.armed_pub = self.create_publisher(Bool, 'rover/armed', control_qos)
         self.odom_pub = self.create_publisher(Odometry, 'odom', control_qos)
 
@@ -126,9 +140,14 @@ class ArduPilotRoverNode(Node):
             1.0 / self.odom_freq, self.odom_loop
         )
         self.status_timer = self.create_timer(1.0, self.status_loop)
-
-        # Single MAVLink polling timer to avoid recv_match() conflicts
+        self.param_timer = self.create_timer(1.0, self.param_cb)
         self.mavlink_timer = self.create_timer(0.01, self.mavlink_poll_loop)
+
+        self.current_ol_velocity = 0.0
+        self.ol_stamp = self.get_ros_time_as_double()
+
+        self.ol_model_loaded = False
+        self.load_ol_model()
 
         # Initialize connection
         self.get_logger().info('Initializing ArduPilot Rover Node...')
@@ -137,6 +156,33 @@ class ArduPilotRoverNode(Node):
     @staticmethod
     def wrap_pi(angle):
         return math.atan2(math.sin(angle), math.cos(angle))
+
+    def load_ol_model(self):
+        # get the robo rover share directory
+        robo_share_dir = get_package_share_directory("robo_rover")
+        ol_path = os.path.join(robo_share_dir, OL_MODEL_SUBPATH)
+
+        with open(ol_path, "r") as file:
+            try:
+                model_raw = yaml.safe_load(file)
+            except Exception:
+                self.get_logger().error("Failed to open ol model!")
+                return
+
+        self.ol_model = SimpleNamespace()
+        self.ol_model.velocity = SimpleNamespace()
+        self.ol_model.steering = SimpleNamespace()
+        self.ol_model.time_constant = model_raw["time_constant"]
+        self.ol_model.velocity.ol_velocities = np.array(
+            model_raw["velocity"]["steady_state_velocity"]
+        )
+        self.ol_model.velocity.pwms = np.array(model_raw["velocity"]["pwm_values"])
+        self.ol_model.steering.ol_radius = np.array(
+            model_raw["angular"]["turn_radius_values"]
+        )
+        self.ol_model.steering.pwms = np.array(model_raw["angular"]["pwm_values"])
+
+        self.ol_model_loaded = True
 
     def connect_to_rover(self):
         """Connect to the rover via MAVLink"""
@@ -164,12 +210,17 @@ class ArduPilotRoverNode(Node):
 
             self.connected = True
 
-            # Set mode to ACRO
-            if self.set_mode('ACRO'):
+            desired_mode = "ACRO"
+            if self.is_manual:
+                desired_mode = "MANUAL"
+                self.get_logger().warn("Must move steering servo into servo slot 4!")
+            else:
+                self.get_logger().warn("Must move steering servo into servo slot 2!")
+
+            if self.set_mode(desired_mode):
                 time.sleep(2)
                 self.arm_rover()
                 self.request_imu_data()
-                self.request_odom_data()
 
             return True
 
@@ -197,6 +248,7 @@ class ArduPilotRoverNode(Node):
             mode_id
         )
 
+        # Wait for mode change confirmation
         start_time = time.time()
         while time.time() - start_time < 5:
             msg = self.master.recv_match(type='HEARTBEAT', blocking=False)
@@ -225,6 +277,7 @@ class ArduPilotRoverNode(Node):
             1, 0, 0, 0, 0, 0, 0
         )
 
+        # Wait for arming confirmation
         start_time = time.time()
         while time.time() - start_time < 10:
             msg = self.master.recv_match(type='HEARTBEAT', blocking=False)
@@ -274,27 +327,31 @@ class ArduPilotRoverNode(Node):
             return
 
         try:
-            self.request_message_interval(26, self.imu_freq)  # SCALED_IMU
+            self.request_message_interval(26, self.imu_freq)
             self.get_logger().info(f'Requested IMU data at {self.imu_freq} Hz')
         except Exception as e:
             self.get_logger().error(f'Failed to request IMU data: {e}')
 
-    def request_odom_data(self):
-        """Request attitude + speed messages for dead-reckoned odometry"""
-        if not self.connected:
-            return
-
-        try:
-            self.request_message_interval(30, self.odom_freq)  # ATTITUDE
-            self.request_message_interval(74, self.odom_freq)  # VFR_HUD
-            self.get_logger().info(
-                f'Requested odom-related MAVLink data at {self.odom_freq} Hz'
-            )
-        except Exception as e:
-            self.get_logger().error(f'Failed to request odom data: {e}')
-
     def cmd_vel_callback(self, msg):
         """Handle incoming velocity commands"""
+        if self.is_manual:
+            # Safety first: manual mode expects raw PWM values.
+            if (msg.linear.x < PWM_MIN) or (msg.linear.x > PWM_MAX):
+                self.current_throttle = NEUTRAL_PWM
+            else:
+                self.current_throttle = msg.linear.x
+
+            if (msg.angular.z < PWM_MIN) or (msg.angular.z > PWM_MAX):
+                self.current_steering = NEUTRAL_PWM
+            else:
+                self.current_steering = msg.angular.z
+
+            self.last_cmd_linear = 0.0
+            self.last_cmd_time = time.time()
+            self.last_cmd_time_ros = self.get_clock().now()
+            return
+
+        # adds offset to throttle to make it act more linear
         throttle_raw = msg.linear.x * -400
         offset = 80
 
@@ -303,9 +360,11 @@ class ArduPilotRoverNode(Node):
         else:
             throttle_with_offset = throttle_raw - offset
 
+        # Scale to MAVLink range (-1000 to 1000)
         self.current_throttle = int(np.clip(throttle_with_offset, -300, 300))
         self.current_steering = int(np.clip(msg.angular.z * 500, -1000, 1000))
         self.last_cmd_linear = float(msg.linear.x)
+        self.last_cmd_time = time.time()
         self.last_cmd_time_ros = self.get_clock().now()
 
         self.get_logger().debug(
@@ -329,20 +388,29 @@ class ArduPilotRoverNode(Node):
                 if msg_type == 'SCALED_IMU':
                     self.latest_scaled_imu = msg
                     self.latest_scaled_imu_ros_time = self.get_clock().now()
-                elif msg_type == 'ATTITUDE':
-                    self.latest_attitude = msg
-                elif msg_type == 'VFR_HUD':
-                    self.latest_vfr_hud = msg
                 elif msg_type == 'HEARTBEAT':
                     self.latest_heartbeat = msg
 
         except Exception as e:
             self.get_logger().error(f'MAVLink polling error: {repr(e)}')
-            raise
 
     def control_loop(self):
         """Main control loop - sends commands at fixed rate"""
         if not self.connected or not self.armed:
+            self.rate_mapping_cb()
+            return
+
+        if self.is_manual:
+            if time.time() - self.last_cmd_time > self.cmd_timeout:
+                throttle = NEUTRAL_PWM
+                steering = NEUTRAL_PWM
+            else:
+                throttle = self.current_throttle
+                steering = self.current_steering
+
+            self.set_servo_pwm(STEER_SERVO, steering)
+            self.set_servo_pwm(DRIVE_SERVO, throttle)
+            self.rate_mapping_cb()
             return
 
         now = self.get_clock().now()
@@ -387,12 +455,92 @@ class ArduPilotRoverNode(Node):
         accel_msg.z = (scaled_imu_msg.zacc / 1000.0) * 9.80665
         self.accel_pub.publish(accel_msg)
 
-    def odom_loop(self):
-        """Publish dead-reckoned odometry using integrated SCALED_IMU z-gyro + commanded speed"""
-        if not self.connected:
-            return
+    def rate_mapping_cb(self):
+        if self.manaual_rate_mapping and self.is_manual and self.ol_model_loaded:
+            # publish a mapping of the inputs to an open loop rate
+            steady_state_vel = self.get_velocity_ol_steady_state()
 
-        if self.latest_scaled_imu is None:
+            # treat this as a first order system
+            current_time = self.get_ros_time_as_double()
+            gap_closure = exp(
+                -1 * (current_time - self.ol_stamp) / self.ol_model.time_constant
+            )
+            self.current_ol_velocity = (
+                (self.current_ol_velocity - steady_state_vel) * gap_closure
+                + steady_state_vel
+            )
+
+            msg = Twist()
+            msg.linear.x = self.current_ol_velocity
+            msg.angular.z = float(self.current_ol_velocity) / float(
+                self.get_turn_radius_ol()
+            )
+            self.ol_rate_pub.publish(msg)
+
+            self.ol_stamp = current_time
+
+    def get_velocity_ol_steady_state(self):
+        greater_pwms = np.where(self.ol_model.velocity.pwms > self.current_throttle)[0]
+
+        if len(greater_pwms) == 0:
+            return self.ol_model.velocity.ol_velocities[0]
+
+        h_pwm = greater_pwms[0]
+        l_pwm = greater_pwms[0] - 1
+        if h_pwm == 0:
+            return self.ol_model.velocity.ol_velocities[0]
+
+        # linearly interpolate
+        m = (
+            self.ol_model.velocity.ol_velocities[h_pwm]
+            - self.ol_model.velocity.ol_velocities[l_pwm]
+        ) / (
+            self.ol_model.velocity.pwms[h_pwm]
+            - self.ol_model.velocity.pwms[l_pwm]
+        )
+        b = self.ol_model.velocity.ol_velocities[l_pwm]
+
+        return b + m * (self.current_throttle - self.ol_model.velocity.pwms[l_pwm])
+
+    def get_turn_radius_ol(self):
+        greater_pwms = np.where(self.ol_model.steering.pwms > self.current_steering)[0]
+
+        if len(greater_pwms) == 0:
+            return self.ol_model.steering.ol_radius[0]
+
+        h_pwm = greater_pwms[0]
+        l_pwm = greater_pwms[0] - 1
+        if h_pwm == 0:
+            return self.ol_model.steering.ol_radius[0]
+
+        # linearly interpolate
+        m = (
+            self.ol_model.steering.ol_radius[h_pwm]
+            - self.ol_model.steering.ol_radius[l_pwm]
+        ) / (
+            self.ol_model.steering.pwms[h_pwm]
+            - self.ol_model.steering.pwms[l_pwm]
+        )
+        b = self.ol_model.steering.ol_radius[l_pwm]
+
+        return b + m * (self.current_steering - self.ol_model.steering.pwms[l_pwm])
+
+    def get_odom_groundspeed(self, now):
+        if self.is_manual:
+            if time.time() - self.last_cmd_time > self.cmd_timeout:
+                return 0.0
+            if self.manaual_rate_mapping and self.ol_model_loaded:
+                return float(self.current_ol_velocity)
+            return 0.0
+
+        cmd_age = (now - self.last_cmd_time_ros).nanoseconds / 1e9
+        if cmd_age > self.cmd_timeout:
+            return 0.0
+        return float(self.last_cmd_linear)
+
+    def odom_loop(self):
+        """Publish dead-reckoned odometry using integrated SCALED_IMU z-gyro"""
+        if not self.connected or self.latest_scaled_imu is None:
             return
 
         now = self.get_clock().now()
@@ -409,7 +557,6 @@ class ArduPilotRoverNode(Node):
         if dt <= 0.0 or dt > 1.0:
             return
 
-        # Reject very stale IMU data
         if self.latest_scaled_imu_ros_time is None:
             return
 
@@ -423,10 +570,7 @@ class ArduPilotRoverNode(Node):
         # SCALED_IMU zgyro is in mrad/s -> rad/s
         wz_meas = float(self.latest_scaled_imu.zgyro) / 1000.0
 
-        # -----------------------------
-        # Startup gyro bias calibration
-        # Keep robot still for a few seconds after launch
-        # -----------------------------
+        # Startup gyro bias calibration. Keep the robot still after launch.
         if not self.gyro_bias_ready:
             elapsed = (now - self.gyro_cal_start_time).nanoseconds / 1e9
 
@@ -455,33 +599,20 @@ class ArduPilotRoverNode(Node):
 
             self.get_logger().info(
                 f'Gyro bias calibration done: '
-                f'{self.gyro_bias_z:.6f} rad/s ({math.degrees(self.gyro_bias_z):.4f} deg/s)'
+                f'{self.gyro_bias_z:.6f} rad/s '
+                f'({math.degrees(self.gyro_bias_z):.4f} deg/s)'
             )
             return
 
-        # -----------------------------
-        # Integrate gyro z to get yaw
-        # -----------------------------
+        # For ROS yaw, we want left positive and right negative, so flip sign.
         wz_unbiased = wz_meas - self.gyro_bias_z
-
-        # Based on your test:
-        # right turn -> integrated yaw went positive
-        # left turn  -> integrated yaw went negative
-        # For ROS yaw, we want left positive and right negative, so flip sign here.
         delta_yaw = -(wz_unbiased * dt)
 
         yaw_old = self.last_yaw_ros
         yaw_mid = self.wrap_pi(yaw_old + 0.5 * delta_yaw)
         yaw_new = self.wrap_pi(yaw_old + delta_yaw)
 
-        # Commanded linear velocity as forward speed proxy
-        cmd_age = (now - self.last_cmd_time_ros).nanoseconds / 1e9
-        if cmd_age > self.cmd_timeout:
-            groundspeed = 0.0
-        else:
-            groundspeed = float(self.last_cmd_linear)
-
-        # Midpoint integration for Ackermann-like arcs
+        groundspeed = self.get_odom_groundspeed(now)
         self.odom_x += groundspeed * math.cos(yaw_mid) * dt
         self.odom_y += groundspeed * math.sin(yaw_mid) * dt
 
@@ -516,28 +647,27 @@ class ArduPilotRoverNode(Node):
         odom_msg.twist.twist.linear.x = groundspeed
         odom_msg.twist.twist.linear.y = 0.0
         odom_msg.twist.twist.linear.z = 0.0
-
         odom_msg.twist.twist.angular.x = 0.0
         odom_msg.twist.twist.angular.y = 0.0
         odom_msg.twist.twist.angular.z = delta_yaw / dt if dt > 0.0 else 0.0
 
         # Covariances: planar rover, approximate dead reckoning
         odom_msg.pose.covariance = [
-            0.15, 0.0,  0.0,    0.0,    0.0,    0.0,
-            0.0,  0.15, 0.0,    0.0,    0.0,    0.0,
-            0.0,  0.0,  9999.0, 0.0,    0.0,    0.0,
-            0.0,  0.0,  0.0,    9999.0, 0.0,    0.0,
-            0.0,  0.0,  0.0,    0.0,    9999.0, 0.0,
-            0.0,  0.0,  0.0,    0.0,    0.0,    0.4
+            0.15, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.15, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 9999.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 9999.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 9999.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.4
         ]
 
         odom_msg.twist.covariance = [
-            0.20, 0.0,  0.0,    0.0,    0.0,    0.0,
-            0.0,  0.20, 0.0,    0.0,    0.0,    0.0,
-            0.0,  0.0,  9999.0, 0.0,    0.0,    0.0,
-            0.0,  0.0,  0.0,    9999.0, 0.0,    0.0,
-            0.0,  0.0,  0.0,    0.0,    9999.0, 0.0,
-            0.0,  0.0,  0.0,    0.0,    0.0,    0.3
+            0.20, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.20, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 9999.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 9999.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 9999.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.3
         ]
 
         self.odom_pub.publish(odom_msg)
@@ -546,16 +676,13 @@ class ArduPilotRoverNode(Node):
         tf_msg.header.stamp = stamp
         tf_msg.header.frame_id = self.odom_frame
         tf_msg.child_frame_id = self.base_frame
-
         tf_msg.transform.translation.x = self.odom_x
         tf_msg.transform.translation.y = self.odom_y
         tf_msg.transform.translation.z = 0.0
-
         tf_msg.transform.rotation.x = float(quat[0])
         tf_msg.transform.rotation.y = float(quat[1])
         tf_msg.transform.rotation.z = float(quat[2])
         tf_msg.transform.rotation.w = float(quat[3])
-
         self.tf_broadcaster.sendTransform(tf_msg)
 
     def status_loop(self):
@@ -570,16 +697,53 @@ class ArduPilotRoverNode(Node):
                 mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
             )
 
+    def param_cb(self):
+        # callback for handling changed robo rover parameters
+        if self.is_manual != self.get_parameter('manual_mode').value:
+            # make sure these are neutral before changing modes
+            self.set_servo_pwm(3, NEUTRAL_PWM)
+            self.set_servo_pwm(4, NEUTRAL_PWM)
+
+            self.is_manual = self.get_parameter('manual_mode').value
+            self.last_cmd_linear = 0.0
+            self.last_cmd_time = time.time()
+            self.last_cmd_time_ros = self.get_clock().now()
+
+            self.get_logger().warn(
+                "If moving to manual mode, move the steer servo to 4. "
+                "If moving to acro, move steer servo to 2!"
+            )
+
+            desired_mode = "MANUAL" if self.is_manual else "ACRO"
+            self.set_mode(desired_mode)
+
+        ol_mapping = self.get_parameter('ol_rate_mapping').value
+        if ol_mapping != self.manaual_rate_mapping:
+            self.manaual_rate_mapping = ol_mapping
+
+            if ol_mapping:
+                self.current_ol_velocity = self.get_velocity_ol_steady_state()
+                self.ol_stamp = self.get_ros_time_as_double()
+
+    def get_ros_time_as_double(self):
+        # return the ros2 time as float
+        now_sec, now_nsec = self.get_clock().now().seconds_nanoseconds()
+        return now_sec + now_nsec * 1e-9
+
     def destroy_node(self):
         """Clean up when node is destroyed"""
         self.get_logger().info('Shutting down rover node...')
 
         if self.connected and self.armed:
             try:
-                self.master.mav.manual_control_send(
-                    self.master.target_system,
-                    0, 0, 0, 0, 0
-                )
+                if self.is_manual:
+                    self.set_servo_pwm(STEER_SERVO, NEUTRAL_PWM)
+                    self.set_servo_pwm(DRIVE_SERVO, NEUTRAL_PWM)
+                else:
+                    self.master.mav.manual_control_send(
+                        self.master.target_system,
+                        0, 0, 0, 0, 0
+                    )
                 time.sleep(0.1)
                 self.disarm_rover()
             except Exception:
@@ -589,6 +753,13 @@ class ArduPilotRoverNode(Node):
             self.master.close()
 
         super().destroy_node()
+
+    def set_servo_pwm(self, servo, pwm):
+        self.master.mav.command_long_send(
+            self.master.target_system, self.master.target_component,
+            mavutil.mavlink.MAV_CMD_DO_SET_SERVO, 0,
+            servo, pwm, 0, 0, 0, 0, 0
+        )
 
 
 def main(args=None):
