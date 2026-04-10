@@ -11,11 +11,25 @@ from geometry_msgs.msg import Twist
 from sensor_msgs.msg import Imu
 from std_msgs.msg import Bool
 import time
-import threading
 from pymavlink import mavutil
 import numpy as np
 from scipy.spatial.transform import Rotation
 from geometry_msgs.msg import Vector3
+from math import exp
+import os
+import yaml
+from types import SimpleNamespace
+
+
+from ament_index_python import get_package_share_directory
+
+STEER_SERVO = 4
+DRIVE_SERVO = 3
+PWM_MAX = 2000
+NEUTRAL_PWM = 1500
+PWM_MIN = 1000
+
+OL_MODEL_SUBPATH = "resource/ol_data.yaml"
 
 class ArduPilotRoverNode(Node):
     def __init__(self):
@@ -26,12 +40,16 @@ class ArduPilotRoverNode(Node):
         self.declare_parameter('baud_rate', 115200)
         self.declare_parameter('control_frequency', 20.0)
         self.declare_parameter('imu_frequency', 20.0)
+        self.declare_parameter('manual_mode', True)
+        self.declare_parameter('ol_rate_mapping', True)
         
         # Get parameters
         self.connection_string = self.get_parameter('connection_string').value
         self.baud_rate = self.get_parameter('baud_rate').value
         self.control_freq = self.get_parameter('control_frequency').value
         self.imu_freq = self.get_parameter('imu_frequency').value
+        self.is_manual = self.get_parameter('manual_mode').value
+        self.manaual_rate_mapping = self.get_parameter('ol_rate_mapping').value
         
         # Control variables
         self.default_throttle = 0.0
@@ -62,6 +80,7 @@ class ArduPilotRoverNode(Node):
         # Publishers
         self.gyro_pub = self.create_publisher(Vector3, 'imu/gyro', sensor_qos)
         self.accel_pub = self.create_publisher(Vector3, 'imu/accel', sensor_qos)
+        self.ol_rate_pub = self.create_publisher(Twist, 'ol_rates', sensor_qos)
         self.armed_pub = self.create_publisher(Bool, 'rover/armed', control_qos)
         
         # Subscribers
@@ -74,11 +93,46 @@ class ArduPilotRoverNode(Node):
         self.imu_timer = self.create_timer(
             1.0 / self.imu_freq, self.imu_loop)
         self.status_timer = self.create_timer(1.0, self.status_loop)
+        self.param_timer = self.create_timer(1.0, self.param_cb)
         
+        self.current_ol_velocity = 0.0
+        self.ol_stamp = self.get_ros_time_as_double()
+
+        self.ol_model_loaded = False
+        self.load_ol_model()
+
         # Initialize connection
         self.get_logger().info('Initializing ArduPilot Rover Node...')
         self.connect_to_rover()
         
+    def load_ol_model(self):
+
+        #get the robo rover share directory
+        robo_share_dir = get_package_share_directory("robo_rover")
+        ol_path = os.path.join(robo_share_dir, OL_MODEL_SUBPATH)
+
+        with open(ol_path, "r") as file:
+            try:
+                model_raw = yaml.safe_load(file)
+
+            except:
+                self.get_logger().error("Failed to open ol model!")
+                return
+            
+        self.ol_model = SimpleNamespace()
+        self.ol_model.velocity = SimpleNamespace()
+        self.ol_model.steering = SimpleNamespace()
+        self.ol_model.time_constant = model_raw["time_constant"]
+        self.ol_model.velocity.ol_velocities = np.array(model_raw["velocity"]["steady_state_velocity"])
+        self.ol_model.velocity.pwms = np.array(model_raw["velocity"]["pwm_values"])
+        self.ol_model.steering.ol_radius = np.array(model_raw["angular"]["turn_radius_values"])
+        self.ol_model.steering.pwms = np.array(model_raw["angular"]["pwm_values"])
+
+        self.ol_model_loaded = True
+
+
+
+
     def connect_to_rover(self):
         """Connect to the rover via MAVLink"""
         try:
@@ -105,8 +159,16 @@ class ArduPilotRoverNode(Node):
             
             self.connected = True
             
+            desired_mode = "ACRO"
+            if(self.is_manual):
+                desired_mode = "MANUAL"
+                self.get_logger().warn("Must move steering servo into servo slot 4!")
+            else:
+                self.get_logger().warn("Must move steering servo into servo slot 2!")
+
+
             # Set mode to ACRO
-            if self.set_mode('ACRO'):
+            if self.set_mode(desired_mode):
                 time.sleep(2)
                 # Arm the rover
                 self.arm_rover()
@@ -230,6 +292,21 @@ class ArduPilotRoverNode(Node):
         # msg.linear.x: forward/backward speed (-1.0 to 1.0)
         # msg.angular.z: turning rate (-2.0 to 2.0)
         
+        if(self.is_manual):
+
+            #safety first
+            if(msg.linear.x < PWM_MIN) or (msg.linear.x > PWM_MAX):
+                self.current_throttle = NEUTRAL_PWM
+            if(msg.angular.z < PWM_MIN) or (msg.angular.z > PWM_MAX):
+                self.current_steering = NEUTRAL_PWM
+
+            self.current_throttle = msg.linear.x
+            self.current_steering = msg.angular.z
+
+            self.last_cmd_time = time.time()
+
+            return
+            
         # adds offset to throttle to make it act more linear
         throttle_raw = msg.linear.x * -400
         offset = 80
@@ -254,30 +331,53 @@ class ArduPilotRoverNode(Node):
     def control_loop(self):
         """Main control loop - sends commands at fixed rate"""
         if not self.connected or not self.armed:
+
             return
         
-        # Check for command timeout
-        if time.time() - self.last_cmd_time > self.cmd_timeout:
-            # Use default values if no recent commands
-            throttle = int(self.default_throttle * 1000)
-            steering = int(self.default_steering * 1000)
+        if self.is_manual:
+
+            if time.time() - self.last_cmd_time > self.cmd_timeout:
+                # Use default values if no recent commands
+                throttle = NEUTRAL_PWM
+                steering = NEUTRAL_PWM
+            else:
+                throttle = self.current_throttle
+                steering = self.current_steering
+
+
+            self.set_servo_pwm(STEER_SERVO, steering)
+            self.set_servo_pwm(DRIVE_SERVO, throttle)
+
+            self.get_logger().info(f"Setting drive servo to {throttle}")
+
+            #update the ol rate mapping
+            self.rate_mapping_cb()
+
         else:
-            throttle = self.current_throttle
-            steering = self.current_steering
+            #run acro
+            # Check for command timeout
+            if time.time() - self.last_cmd_time > self.cmd_timeout:
+                # Use default values if no recent commands
+                throttle = int(self.default_throttle * 1000)
+                steering = int(self.default_steering * 1000)
+            else:
+                throttle = self.current_throttle
+                steering = self.current_steering
+            
+            # Send manual control command
+            try:
+                self.master.mav.manual_control_send(
+                    self.master.target_system,
+                    0,      
+                    steering,    
+                    throttle,      
+                    0,           
+                    0            
+                )
+            except Exception as e:
+                self.get_logger().error(f'Failed to send control command: {e}')
+
         
-        # Send manual control command
-        try:
-            self.master.mav.manual_control_send(
-                self.master.target_system,
-                0,      
-                steering,    
-                throttle,      
-                0,           
-                0            
-            )
-        except Exception as e:
-            self.get_logger().error(f'Failed to send control command: {e}')
-    
     def imu_loop(self):
         """IMU data processing loop"""
         if not self.connected:
@@ -303,7 +403,65 @@ class ArduPilotRoverNode(Node):
         accel_msg.y = (scaled_imu_msg.yacc / 1000.0) * 9.80665
         accel_msg.z = (scaled_imu_msg.zacc / 1000.0) * 9.80665
         self.accel_pub.publish(accel_msg)
+    
+    def rate_mapping_cb(self):
+
+        if(self.manaual_rate_mapping and self.is_manual and self.ol_model_loaded):
+            #publish a mapping of the inputs to an open loop rate
+
+            #calculate the velocity at steady state based on the pwm
+            steady_state_vel = self.get_velocity_ol_steady_state()
+
+            #treat this as a first order system
+            current_time  = self.get_ros_time_as_double()
+            gap_closure = exp(-1*(current_time - self.ol_stamp) / self.ol_model.time_constant)
+            self.current_ol_velocity = (self.current_ol_velocity - steady_state_vel) * gap_closure + steady_state_vel
+
+            #publish the rate
+            msg = Twist()
+            msg.linear.x = self.current_ol_velocity
+            msg.angular.z = self.current_ol_velocity / self.get_turn_radius_ol()
+
+            self.ol_rate_pub.publish(msg) 
+
+            self.ol_stamp = current_time
+            
+
+    def get_velocity_ol_steady_state(self):
+        greater_pwms = np.where(self.ol_model.velocity.pwms > self.current_throttle)[0]
+
+        if(len(greater_pwms) == 0):
+            return self.ol_model.velocity.ol_velocities[0]
         
+        h_pwm = greater_pwms[0]
+        l_pwm = greater_pwms[0] - 1
+        if(h_pwm == 0):
+            return self.ol_model.velocity.ol_velocities[0]
+
+        #linearly interpolate
+        m = (self.ol_model.velocity.ol_velocities[h_pwm] - self.ol_model.velocity.ol_velocities[l_pwm]) / (self.ol_model.velocity.pwms[h_pwm] - self.ol_model.velocity.pwms[l_pwm])
+        b = self.ol_model.velocity.ol_velocities[l_pwm]
+
+        return b + m * (self.current_throttle - self.ol_model.velocity.pwms[l_pwm] )
+        
+
+    def get_turn_radius_ol(self):
+        greater_pwms = np.where(self.ol_model.steering.pwms > self.current_steering)[0]
+
+        if(len(greater_pwms) == 0):
+            return self.ol_model.steering.ol_radius[0]
+        
+        h_pwm = greater_pwms[0]
+        l_pwm = greater_pwms[0] - 1
+        if(h_pwm == 0):
+            return self.ol_model.steering.ol_radius[0]
+
+        #linearly interpolate
+        m = (self.ol_model.steering.ol_radius[h_pwm] - self.ol_model.steering.ol_radius[l_pwm]) / (self.ol_model.steering.pwms[h_pwm] - self.ol_model.steering.pwms[l_pwm])
+        b = self.ol_model.steering.ol_radius[l_pwm]
+
+        return b + m * (self.current_steering - self.ol_model.steering.pwms[l_pwm] )
+
     
     def status_loop(self):
         """Publish status information"""
@@ -318,7 +476,42 @@ class ArduPilotRoverNode(Node):
             if heartbeat is not None:
                 # Update armed status from heartbeat
                 self.armed = bool(heartbeat.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
-    
+
+    def param_cb(self):
+
+        #callback for handling changed to robo rover parameters
+
+        #handle changes with manual mode
+        if not (self.is_manual == self.get_parameter('manual_mode').value):
+
+            #make sure these are nuetral
+            self.set_servo_pwm(3, NEUTRAL_PWM)
+            self.set_servo_pwm(4, NEUTRAL_PWM)
+
+            self.is_manual = self.get_parameter('manual_mode').value
+
+            self.get_logger().warn("If moving to manual mode, move the steer servo to 4. If moving to acro, move steer servo to 2!")
+
+            #update the control mode
+            desired_mode = "ACRO"
+            if(self.is_manual):
+                desired_mode = "MANUAL"
+            self.set_mode(desired_mode)
+
+        ol_mapping = self.get_parameter('ol_rate_mapping').value
+        if not (ol_mapping == self.manaual_rate_mapping):
+
+            self.manaual_rate_mapping = ol_mapping
+
+            if(ol_mapping):
+                #initial the ol system
+                self.current_ol_velocity = self.get_velocity_ol_steady_state()
+                self.ol_stamp = self.get_ros_time_as_double()
+                
+    def get_ros_time_as_double(self):
+        #return the ros2 time as float
+        return self.get_clock().now().seconds_nanoseconds()[1] * 1e-9 + self.get_clock().now().seconds_nanoseconds()[0]
+
     def destroy_node(self):
         """Clean up when node is destroyed"""
         self.get_logger().info('Shutting down rover node...')
@@ -339,6 +532,14 @@ class ArduPilotRoverNode(Node):
             self.master.close()
         
         super().destroy_node()
+
+    def set_servo_pwm(self, servo, pwm):
+                    
+        self.master.mav.command_long_send(
+            self.master.target_system, self.master.target_component,
+            mavutil.mavlink.MAV_CMD_DO_SET_SERVO, 0,
+            servo, pwm, 0, 0, 0, 0, 0
+        )
 
 
 def main(args=None):

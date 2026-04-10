@@ -23,10 +23,20 @@ install(PROGRAMS
   RENAME rover_node
 )
 
+file(GLOB RESOURCE ${CMAKE_CURRENT_SOURCE_DIR}/resource/*.yaml)
+message( ${RESOURCE})
+
+
 # Install launch files
 install(DIRECTORY
   launch/
   DESTINATION share/${PROJECT_NAME}/launch
+)
+
+#Install the resource riles
+install(PROGRAMS
+  ${RESOURCE}
+  DESTINATION share/${PROJECT_NAME}/resource
 )
 
 if(BUILD_TESTING)
