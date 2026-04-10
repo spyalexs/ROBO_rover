@@ -332,6 +332,8 @@ class ArduPilotRoverNode(Node):
         """Main control loop - sends commands at fixed rate"""
         if not self.connected or not self.armed:
 
+            self.rate_mapping_cb()
+
             return
         
         if self.is_manual:
