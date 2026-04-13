@@ -530,7 +530,15 @@ class ArduPilotRoverNode(Node):
             if time.time() - self.last_cmd_time > self.cmd_timeout:
                 return 0.0
             if self.manaual_rate_mapping and self.ol_model_loaded:
-                return float(self.current_ol_velocity)
+                # Guard against the un-initialised throttle value (0.0) which
+                # sits outside the PWM table and would return a bogus 5.97 m/s.
+                if not (PWM_MIN <= self.current_throttle <= PWM_MAX):
+                    return 0.0
+                # Use instantaneous steady-state lookup instead of the lagged
+                # current_ol_velocity.  Forward PWM (<~1415) gives positive
+                # velocity in ol_data.yaml, which matches the odom convention
+                # (positive groundspeed = forward along the robot x-axis).
+                return float(self.get_velocity_ol_steady_state())
             return 0.0
 
         cmd_age = (now - self.last_cmd_time_ros).nanoseconds / 1e9
