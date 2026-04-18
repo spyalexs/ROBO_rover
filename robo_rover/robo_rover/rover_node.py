@@ -41,7 +41,7 @@ class ArduPilotRoverNode(Node):
         self.declare_parameter('baud_rate', 115200)
         self.declare_parameter('control_frequency', 20.0)
         self.declare_parameter('imu_frequency', 20.0)
-        self.declare_parameter('manual_mode', True)
+        self.declare_parameter('manual_mode', False)
         self.declare_parameter('ol_rate_mapping', True)
         self.declare_parameter('odom_frequency', 20.0)
         self.declare_parameter('cmd_timeout', 1.0)
@@ -732,6 +732,12 @@ class ArduPilotRoverNode(Node):
             if ol_mapping:
                 self.current_ol_velocity = self.get_velocity_ol_steady_state()
                 self.ol_stamp = self.get_ros_time_as_double()
+
+        if not (self.connection_string == self.get_parameter('connection_string').value):
+            self.connection_string = self.get_parameter('connection_string').value
+
+            #re init the connection
+            self.connect_to_rover()
 
     def get_ros_time_as_double(self):
         # return the ros2 time as float
