@@ -13,6 +13,8 @@ setup(
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
         (os.path.join('lib', package_name), glob('scripts/*')),
+        (os.path.join('share', 'robo_rover', 'config'), glob('config/*.yaml')),
+        (os.path.join('share', 'robo_rover', 'urdf'), glob('urdf/*.urdf')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

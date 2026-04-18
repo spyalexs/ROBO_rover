@@ -5,6 +5,17 @@ Combines steering/throttle control, IMU publishing, and odometry publishing
 """
 
 import math
+import time
+from pymavlink import mavutil
+import numpy as np
+import rclpy
+from geometry_msgs.msg import TransformStamped, Twist, Vector3
+from nav_msgs.msg import Odometry
+from pymavlink import mavutil
+from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from scipy.spatial.transform import Rotation
+from geometry_msgs.msg import Vector3
 import os
 import time
 from math import exp
@@ -83,6 +94,8 @@ class ArduPilotRoverNode(Node):
         # Cached MAVLink messages
         self.latest_scaled_imu = None
         self.latest_scaled_imu_ros_time = None
+        self.latest_attitude = None
+        self.latest_vfr_hud = None
         self.latest_heartbeat = None
 
         # Dead-reckoned odom state
@@ -94,7 +107,7 @@ class ArduPilotRoverNode(Node):
         self.last_groundspeed = 0.0
 
         # Gyro-integrated yaw state
-        self.gyro_bias_z = 0.0
+        self.gyro_bias_z = 0.0         # rad/s
         self.gyro_bias_sum = 0.0
         self.gyro_bias_count = 0
         self.gyro_bias_ready = False
@@ -221,6 +234,7 @@ class ArduPilotRoverNode(Node):
                 time.sleep(2)
                 self.arm_rover()
                 self.request_imu_data()
+                self.request_odom_data()
 
             return True
 
@@ -327,10 +341,24 @@ class ArduPilotRoverNode(Node):
             return
 
         try:
-            self.request_message_interval(26, self.imu_freq)
+            self.request_message_interval(26, self.imu_freq)  # SCALED_IMU
             self.get_logger().info(f'Requested IMU data at {self.imu_freq} Hz')
         except Exception as e:
             self.get_logger().error(f'Failed to request IMU data: {e}')
+
+    def request_odom_data(self):
+        """Request attitude + speed messages for dead-reckoned odometry"""
+        if not self.connected:
+            return
+
+        try:
+            self.request_message_interval(30, self.odom_freq)  # ATTITUDE
+            self.request_message_interval(74, self.odom_freq)  # VFR_HUD
+            self.get_logger().info(
+                f'Requested odom-related MAVLink data at {self.odom_freq} Hz'
+            )
+        except Exception as e:
+            self.get_logger().error(f'Failed to request odom data: {e}')
 
     def cmd_vel_callback(self, msg):
         """Handle incoming velocity commands"""
@@ -360,11 +388,9 @@ class ArduPilotRoverNode(Node):
         else:
             throttle_with_offset = throttle_raw - offset
 
-        # Scale to MAVLink range (-1000 to 1000)
         self.current_throttle = int(np.clip(throttle_with_offset, -300, 300))
         self.current_steering = int(np.clip(msg.angular.z * 500, -1000, 1000))
         self.last_cmd_linear = float(msg.linear.x)
-        self.last_cmd_time = time.time()
         self.last_cmd_time_ros = self.get_clock().now()
 
         self.get_logger().debug(
@@ -388,11 +414,16 @@ class ArduPilotRoverNode(Node):
                 if msg_type == 'SCALED_IMU':
                     self.latest_scaled_imu = msg
                     self.latest_scaled_imu_ros_time = self.get_clock().now()
+                elif msg_type == 'ATTITUDE':
+                    self.latest_attitude = msg
+                elif msg_type == 'VFR_HUD':
+                    self.latest_vfr_hud = msg
                 elif msg_type == 'HEARTBEAT':
                     self.latest_heartbeat = msg
 
         except Exception as e:
             self.get_logger().error(f'MAVLink polling error: {repr(e)}')
+            raise
 
     def control_loop(self):
         """Main control loop - sends commands at fixed rate"""
