@@ -2,6 +2,14 @@
 
 This ROS2 package provides integrated control and IMU data publishing for a Pixhawk 4 Mini running ArduPilot Rover firmware.
 
+## Notes from Alex
+
+Known issue is that if the pixhawk is unplugged and plugged back in, sometimes the serial interface the pi uses to connect to it changes. To solver this problem, set the connection string parameter on the pi. If that fails, reboot the pi...
+
+If you want to enable or disable pwm control, change the default value for the parameter manual_mode in the code. True -> pwm, False -> psuedo velocity control
+
+To launch this node, run ros2 launch robo_rover rover_launch.py
+
 ## Topics
 
 ### Published Topics
