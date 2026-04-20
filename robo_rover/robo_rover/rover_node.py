@@ -669,7 +669,7 @@ class ArduPilotRoverNode(Node):
         if cmd_age > self.cmd_timeout:
             groundspeed = 0.0
         else:
-            groundspeed = float(self.last_cmd_linear)
+            groundspeed = float(self.last_cmd_linear) * 2.0
 
         # Midpoint integration for Ackermann-like arcs
         self.odom_x += groundspeed * math.cos(yaw_mid) * dt
