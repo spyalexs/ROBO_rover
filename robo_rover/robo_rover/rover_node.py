@@ -113,6 +113,7 @@ class ArduPilotRoverNode(Node):
         self.gyro_bias_ready = False
         self.gyro_cal_start_time = None
         self.yaw_initialized = False
+        self.imu_velocity = 0.0
 
         # QoS profiles
         sensor_qos = QoSProfile(
@@ -667,9 +668,12 @@ class ArduPilotRoverNode(Node):
         # Commanded linear velocity as forward speed proxy
         cmd_age = (now - self.last_cmd_time_ros).nanoseconds / 1e9
         if cmd_age > self.cmd_timeout:
+            self.imu_velocity = 0.0
             groundspeed = 0.0
         else:
-            groundspeed = float(self.last_cmd_linear) * 2.0
+            fwd_accel = float(self.latest_scaled_imu.xacc) / 1000.0 * 9.80665
+            self.imu_velocity += fwd_accel * dt
+            groundspeed = abs(self.imu_velocity)
 
         # Midpoint integration for Ackermann-like arcs
         self.odom_x += groundspeed * math.cos(yaw_mid) * dt
