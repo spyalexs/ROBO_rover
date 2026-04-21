@@ -116,7 +116,6 @@ class ArduPilotRoverNode(Node):
         self.imu_velocity = 0.0
         self.accel_bias_x = 0.0
         self.accel_bias_sum_x = 0.0
-        self.filtered_accel_x = 0.0
 
         # QoS profiles
         sensor_qos = QoSProfile(
@@ -676,13 +675,10 @@ class ArduPilotRoverNode(Node):
         cmd_age = (now - self.last_cmd_time_ros).nanoseconds / 1e9
         if cmd_age > self.cmd_timeout or abs(self.last_cmd_linear) < 0.01:
             self.imu_velocity = 0.0
-            self.filtered_accel_x = 0.0
             groundspeed = 0.0
         else:
-            raw_accel = float(self.latest_scaled_imu.xacc) / 1000.0 * 9.80665
-            fwd_accel = raw_accel - self.accel_bias_x
-            self.filtered_accel_x = 0.3 * fwd_accel + 0.7 * self.filtered_accel_x
-            self.imu_velocity += self.filtered_accel_x * dt
+            fwd_accel = float(self.latest_scaled_imu.xacc) / 1000.0 * 9.80665 - self.accel_bias_x
+            self.imu_velocity += fwd_accel * dt
             groundspeed = self.imu_velocity
 
         # Midpoint integration for Ackermann-like arcs
