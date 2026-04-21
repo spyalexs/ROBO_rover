@@ -674,7 +674,7 @@ class ArduPilotRoverNode(Node):
 
         # Commanded linear velocity as forward speed proxy
         cmd_age = (now - self.last_cmd_time_ros).nanoseconds / 1e9
-        if cmd_age > self.cmd_timeout:
+        if cmd_age > self.cmd_timeout or abs(self.last_cmd_linear) < 0.01:
             self.imu_velocity = 0.0
             self.filtered_accel_x = 0.0
             groundspeed = 0.0
