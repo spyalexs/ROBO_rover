@@ -673,7 +673,7 @@ class ArduPilotRoverNode(Node):
         else:
             fwd_accel = float(self.latest_scaled_imu.xacc) / 1000.0 * 9.80665
             self.imu_velocity += fwd_accel * dt
-            groundspeed = abs(self.imu_velocity)
+            groundspeed = self.imu_velocity
 
         # Midpoint integration for Ackermann-like arcs
         self.odom_x += groundspeed * math.cos(yaw_mid) * dt
