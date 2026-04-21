@@ -84,6 +84,7 @@ class ArduPilotRoverNode(Node):
         self.current_steering = self.default_steering
         self.last_cmd_time = time.time()
         self.last_cmd_time_ros = self.get_clock().now()
+        self.last_nonzero_cmd_time = self.get_clock().now()
         self.last_cmd_linear = 0.0
 
         # Connection variables
@@ -393,6 +394,8 @@ class ArduPilotRoverNode(Node):
         self.current_steering = int(np.clip(msg.angular.z * 500, -1000, 1000))
         self.last_cmd_linear = float(msg.linear.x)
         self.last_cmd_time_ros = self.get_clock().now()
+        if abs(msg.linear.x) > 0.01:
+            self.last_nonzero_cmd_time = self.get_clock().now()
 
         self.get_logger().debug(
             f'Received cmd_vel: throttle={self.current_throttle}, '
@@ -666,8 +669,8 @@ class ArduPilotRoverNode(Node):
         yaw_new = self.wrap_pi(yaw_old + delta_yaw)
 
         # Commanded linear velocity as forward speed proxy
-        cmd_age = (now - self.last_cmd_time_ros).nanoseconds / 1e9
-        if cmd_age > self.cmd_timeout or abs(self.last_cmd_linear) < 0.01:
+        nonzero_age = (now - self.last_nonzero_cmd_time).nanoseconds / 1e9
+        if nonzero_age > 0.5:
             self.imu_velocity = 0.0
             groundspeed = 0.0
         else:
