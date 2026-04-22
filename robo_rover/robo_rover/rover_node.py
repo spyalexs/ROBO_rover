@@ -58,7 +58,7 @@ class ArduPilotRoverNode(Node):
         self.declare_parameter('cmd_timeout', 1.0)
         self.declare_parameter('odom_frame', 'odom')
         self.declare_parameter('base_frame', 'base_link')
-        self.declare_parameter('gyro_cal_duration', 3.0)
+        self.declare_parameter('gyro_cal_duration', 10.0)
         self.declare_parameter('imu_stale_timeout', 0.20)
         self.declare_parameter('debug_gyro_yaw', False)
         self.declare_parameter('accel_scale', 1.0)
