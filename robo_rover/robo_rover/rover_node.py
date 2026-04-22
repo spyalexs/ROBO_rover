@@ -116,8 +116,6 @@ class ArduPilotRoverNode(Node):
         self.gyro_bias_ready = False
         self.gyro_cal_start_time = None
         self.yaw_initialized = False
-        self.accel_bias_x = 0.0
-        self.accel_bias_sum_x = 0.0
 
         # QoS profiles
         sensor_qos = QoSProfile(
@@ -630,7 +628,6 @@ class ArduPilotRoverNode(Node):
             if elapsed < self.gyro_cal_duration:
                 self.gyro_bias_sum += wz_meas
                 self.gyro_bias_count += 1
-                self.accel_bias_sum_x += float(self.latest_scaled_imu.xacc) / 1000.0 * 9.80665
 
                 if not self.yaw_initialized:
                     self.last_yaw_ros = 0.0
@@ -644,10 +641,8 @@ class ArduPilotRoverNode(Node):
 
             if self.gyro_bias_count > 0:
                 self.gyro_bias_z = self.gyro_bias_sum / self.gyro_bias_count
-                self.accel_bias_x = self.accel_bias_sum_x / self.gyro_bias_count
             else:
                 self.gyro_bias_z = 0.0
-                self.accel_bias_x = 0.0
 
             self.gyro_bias_ready = True
             self.last_yaw_ros = 0.0
@@ -655,8 +650,7 @@ class ArduPilotRoverNode(Node):
 
             self.get_logger().info(
                 f'Gyro bias calibration done: '
-                f'{self.gyro_bias_z:.6f} rad/s ({math.degrees(self.gyro_bias_z):.4f} deg/s) | '
-                f'accel bias x: {self.accel_bias_x:.4f} m/s²'
+                f'{self.gyro_bias_z:.6f} rad/s ({math.degrees(self.gyro_bias_z):.4f} deg/s)'
             )
             return
 
