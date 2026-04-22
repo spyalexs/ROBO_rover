@@ -114,6 +114,9 @@ class ArduPilotRoverNode(Node):
         self.gyro_bias_ready = False
         self.gyro_cal_start_time = None
         self.yaw_initialized = False
+        self.imu_velocity = 0.0
+        self.accel_bias_x = 0.0
+        self.accel_bias_sum_x = 0.0
 
         # QoS profiles
         sensor_qos = QoSProfile(
@@ -626,6 +629,7 @@ class ArduPilotRoverNode(Node):
             if elapsed < self.gyro_cal_duration:
                 self.gyro_bias_sum += wz_meas
                 self.gyro_bias_count += 1
+                self.accel_bias_sum_x += float(self.latest_scaled_imu.xacc) / 1000.0 * 9.80665
 
                 if not self.yaw_initialized:
                     self.last_yaw_ros = 0.0
@@ -639,8 +643,10 @@ class ArduPilotRoverNode(Node):
 
             if self.gyro_bias_count > 0:
                 self.gyro_bias_z = self.gyro_bias_sum / self.gyro_bias_count
+                self.accel_bias_x = self.accel_bias_sum_x / self.gyro_bias_count
             else:
                 self.gyro_bias_z = 0.0
+                self.accel_bias_x = 0.0
 
             self.gyro_bias_ready = True
             self.last_yaw_ros = 0.0
@@ -648,7 +654,8 @@ class ArduPilotRoverNode(Node):
 
             self.get_logger().info(
                 f'Gyro bias calibration done: '
-                f'{self.gyro_bias_z:.6f} rad/s ({math.degrees(self.gyro_bias_z):.4f} deg/s)'
+                f'{self.gyro_bias_z:.6f} rad/s ({math.degrees(self.gyro_bias_z):.4f} deg/s) | '
+                f'accel bias x: {self.accel_bias_x:.4f} m/s²'
             )
             return
 
@@ -668,12 +675,19 @@ class ArduPilotRoverNode(Node):
         yaw_new = self.wrap_pi(yaw_old + delta_yaw)
 
         # Use ArduPilot's fused groundspeed; apply sign from last commanded direction
-        if self.latest_vfr_hud is None:
+        nonzero_age = (now - self.last_nonzero_cmd_time).nanoseconds / 1e9
+        if nonzero_age > 0.5:
+            self.imu_velocity = 0.0
             groundspeed = 0.0
         else:
-            speed_mag = float(self.latest_vfr_hud.groundspeed)
-            direction = 1.0 if self.last_cmd_linear >= 0.0 else -1.0
-            groundspeed = direction * speed_mag
+            fwd_accel = float(self.latest_scaled_imu.xacc) / 1000.0 * 9.80665 - self.accel_bias_x
+            self.imu_velocity += fwd_accel * dt
+            # Clamp to commanded direction: deceleration cannot flip the sign
+            if self.last_cmd_linear >= 0.0:
+                self.imu_velocity = max(0.0, self.imu_velocity)
+            else:
+                self.imu_velocity = min(0.0, self.imu_velocity)
+            groundspeed = self.imu_velocity
 
         # Midpoint integration for Ackermann-like arcs
         self.odom_x += groundspeed * math.cos(yaw_mid) * dt
