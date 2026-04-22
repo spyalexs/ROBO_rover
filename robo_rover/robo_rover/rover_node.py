@@ -61,6 +61,7 @@ class ArduPilotRoverNode(Node):
         self.declare_parameter('gyro_cal_duration', 3.0)
         self.declare_parameter('imu_stale_timeout', 0.20)
         self.declare_parameter('debug_gyro_yaw', False)
+        self.declare_parameter('accel_scale', 1.0)
 
         # Get parameters
         self.connection_string = self.get_parameter('connection_string').value
@@ -76,6 +77,7 @@ class ArduPilotRoverNode(Node):
         self.gyro_cal_duration = float(self.get_parameter('gyro_cal_duration').value)
         self.imu_stale_timeout = float(self.get_parameter('imu_stale_timeout').value)
         self.debug_gyro_yaw = bool(self.get_parameter('debug_gyro_yaw').value)
+        self.accel_scale = float(self.get_parameter('accel_scale').value)
 
         # Control variables
         self.default_throttle = 0.0
@@ -674,20 +676,14 @@ class ArduPilotRoverNode(Node):
         yaw_mid = self.wrap_pi(yaw_old + 0.5 * delta_yaw)
         yaw_new = self.wrap_pi(yaw_old + delta_yaw)
 
-        # Use ArduPilot's fused groundspeed; apply sign from last commanded direction
-        nonzero_age = (now - self.last_nonzero_cmd_time).nanoseconds / 1e9
-        if nonzero_age > 0.5:
-            self.imu_velocity = 0.0
-            groundspeed = 0.0
+        fwd_accel = (float(self.latest_scaled_imu.xacc) / 1000.0 * 9.80665 - self.accel_bias_x) * self.accel_scale
+        self.imu_velocity += fwd_accel * dt
+        # Clamp to commanded direction: deceleration cannot flip the sign
+        if self.last_cmd_linear >= 0.0:
+            self.imu_velocity = max(0.0, self.imu_velocity)
         else:
-            fwd_accel = float(self.latest_scaled_imu.xacc) / 1000.0 * 9.80665 - self.accel_bias_x
-            self.imu_velocity += fwd_accel * dt
-            # Clamp to commanded direction: deceleration cannot flip the sign
-            if self.last_cmd_linear >= 0.0:
-                self.imu_velocity = max(0.0, self.imu_velocity)
-            else:
-                self.imu_velocity = min(0.0, self.imu_velocity)
-            groundspeed = self.imu_velocity
+            self.imu_velocity = min(0.0, self.imu_velocity)
+        groundspeed = self.imu_velocity
 
         # Midpoint integration for Ackermann-like arcs
         self.odom_x += groundspeed * math.cos(yaw_mid) * dt
