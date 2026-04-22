@@ -676,14 +676,22 @@ class ArduPilotRoverNode(Node):
         yaw_mid = self.wrap_pi(yaw_old + 0.5 * delta_yaw)
         yaw_new = self.wrap_pi(yaw_old + delta_yaw)
 
-        fwd_accel = (float(self.latest_scaled_imu.xacc) / 1000.0 * 9.80665 - self.accel_bias_x) * self.accel_scale
-        self.imu_velocity += fwd_accel * dt
-        # Clamp to commanded direction: deceleration cannot flip the sign
-        if self.last_cmd_linear >= 0.0:
-            self.imu_velocity = max(0.0, self.imu_velocity)
+        if abs(self.last_cmd_linear) < 0.01:
+            self.imu_velocity = 0.0
+            groundspeed = 0.0
         else:
-            self.imu_velocity = min(0.0, self.imu_velocity)
-        groundspeed = self.imu_velocity
+            fwd_accel = float(self.latest_scaled_imu.xacc) / 1000.0 * 9.80665 - self.accel_bias_x
+            # Only scale when accelerating in the commanded direction, not when decelerating
+            if (self.last_cmd_linear >= 0.0 and fwd_accel > 0.0) or \
+               (self.last_cmd_linear < 0.0 and fwd_accel < 0.0):
+                fwd_accel *= self.accel_scale
+            self.imu_velocity += fwd_accel * dt
+            # Clamp to commanded direction: deceleration cannot flip the sign
+            if self.last_cmd_linear >= 0.0:
+                self.imu_velocity = max(0.0, self.imu_velocity)
+            else:
+                self.imu_velocity = min(0.0, self.imu_velocity)
+            groundspeed = self.imu_velocity
 
         # Midpoint integration for Ackermann-like arcs
         self.odom_x += groundspeed * math.cos(yaw_mid) * dt
