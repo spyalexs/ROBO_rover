@@ -58,10 +58,10 @@ class ArduPilotRoverNode(Node):
         self.declare_parameter('cmd_timeout', 1.0)
         self.declare_parameter('odom_frame', 'odom')
         self.declare_parameter('base_frame', 'base_link')
-        self.declare_parameter('gyro_cal_duration', 10.0)
+        self.declare_parameter('gyro_cal_duration', 3.0)
         self.declare_parameter('imu_stale_timeout', 0.20)
         self.declare_parameter('debug_gyro_yaw', False)
-        self.declare_parameter('accel_scale', 1.0)
+        self.declare_parameter('cmd_vel_scale', 1.0)
 
         # Get parameters
         self.connection_string = self.get_parameter('connection_string').value
@@ -77,7 +77,7 @@ class ArduPilotRoverNode(Node):
         self.gyro_cal_duration = float(self.get_parameter('gyro_cal_duration').value)
         self.imu_stale_timeout = float(self.get_parameter('imu_stale_timeout').value)
         self.debug_gyro_yaw = bool(self.get_parameter('debug_gyro_yaw').value)
-        self.accel_scale = float(self.get_parameter('accel_scale').value)
+        self.cmd_vel_scale = float(self.get_parameter('cmd_vel_scale').value)
 
         # Control variables
         self.default_throttle = 0.0
@@ -116,7 +116,6 @@ class ArduPilotRoverNode(Node):
         self.gyro_bias_ready = False
         self.gyro_cal_start_time = None
         self.yaw_initialized = False
-        self.imu_velocity = 0.0
         self.accel_bias_x = 0.0
         self.accel_bias_sum_x = 0.0
 
@@ -676,22 +675,7 @@ class ArduPilotRoverNode(Node):
         yaw_mid = self.wrap_pi(yaw_old + 0.5 * delta_yaw)
         yaw_new = self.wrap_pi(yaw_old + delta_yaw)
 
-        if abs(self.last_cmd_linear) < 0.01:
-            self.imu_velocity = 0.0
-            groundspeed = 0.0
-        else:
-            fwd_accel = float(self.latest_scaled_imu.xacc) / 1000.0 * 9.80665 - self.accel_bias_x
-            # Only scale when accelerating in the commanded direction, not when decelerating
-            if (self.last_cmd_linear >= 0.0 and fwd_accel > 0.0) or \
-               (self.last_cmd_linear < 0.0 and fwd_accel < 0.0):
-                fwd_accel *= self.accel_scale
-            self.imu_velocity += fwd_accel * dt
-            # Clamp to commanded direction: deceleration cannot flip the sign
-            if self.last_cmd_linear >= 0.0:
-                self.imu_velocity = max(0.0, self.imu_velocity)
-            else:
-                self.imu_velocity = min(0.0, self.imu_velocity)
-            groundspeed = self.imu_velocity
+        groundspeed = self.last_cmd_linear * self.cmd_vel_scale
 
         # Midpoint integration for Ackermann-like arcs
         self.odom_x += groundspeed * math.cos(yaw_mid) * dt

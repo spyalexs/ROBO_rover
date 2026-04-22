@@ -45,9 +45,9 @@ def generate_launch_description():
     )
 
     accel_scale_arg = DeclareLaunchArgument(
-        'accel_scale',
+        'cmd_vel_scale',
         default_value='1.0',
-        description='Scale factor applied to IMU forward acceleration for odometry'
+        description='Scale factor applied to commanded velocity for odometry'
     )
 
     # Rover node
@@ -63,7 +63,7 @@ def generate_launch_description():
             'baud_rate': LaunchConfiguration('baud_rate'),
             'control_frequency': LaunchConfiguration('control_frequency'),
             'imu_frequency': LaunchConfiguration('imu_frequency'),
-            'accel_scale': LaunchConfiguration('accel_scale'),
+            'cmd_vel_scale': LaunchConfiguration('cmd_vel_scale'),
         }],
     )
 
