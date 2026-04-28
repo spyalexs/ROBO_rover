@@ -561,33 +561,22 @@ class ArduPilotRoverNode(Node):
 
         return b + m * (self.current_steering - self.ol_model.steering.pwms[l_pwm])
 
-    # def get_odom_groundspeed(self, now):
-    #     if self.is_manual:
-    #         if time.time() - self.last_cmd_time > self.cmd_timeout:
-    #             return 0.0
-    #         if self.manaual_rate_mapping and self.ol_model_loaded:
-    #             # Guard against the un-initialised throttle value (0.0) which
-    #             # sits outside the PWM table and would return a bogus 5.97 m/s.
-    #             if not (PWM_MIN <= self.current_throttle <= PWM_MAX):
-    #                 return 0.0
-    #             # Use instantaneous steady-state lookup instead of the lagged
-    #             # current_ol_velocity.  Forward PWM (<~1415) gives positive
-    #             # velocity in ol_data.yaml, which matches the odom convention
-    #             # (positive groundspeed = forward along the robot x-axis).
-    #             return float(self.get_velocity_ol_steady_state())
-    #         return 0.0
+    def get_odom_groundspeed(self, now):
+        if self.is_manual:
+            if time.time() - self.last_cmd_time > self.cmd_timeout:
+                return 0.0
+            if self.manaual_rate_mapping and self.ol_model_loaded:
+                return float(self.current_ol_velocity)
+            return 0.0
 
-    #     cmd_age = (now - self.last_cmd_time_ros).nanoseconds / 1e9
-    #     if cmd_age > self.cmd_timeout:
-    #         return 0.0
-    #     return float(self.last_cmd_linear)
-    
+        cmd_age = (now - self.last_cmd_time_ros).nanoseconds / 1e9
+        if cmd_age > self.cmd_timeout:
+            return 0.0
+        return float(self.last_cmd_linear)
+
     def odom_loop(self):
-        """Publish dead-reckoned odometry using integrated SCALED_IMU z-gyro + commanded speed"""
-        if not self.connected:
-            return
-
-        if self.latest_scaled_imu is None:
+        """Publish dead-reckoned odometry using integrated SCALED_IMU z-gyro"""
+        if not self.connected or self.latest_scaled_imu is None:
             return
 
         now = self.get_clock().now()
@@ -604,7 +593,6 @@ class ArduPilotRoverNode(Node):
         if dt <= 0.0 or dt > 1.0:
             return
 
-        # Reject very stale IMU data
         if self.latest_scaled_imu_ros_time is None:
             return
 
@@ -618,10 +606,7 @@ class ArduPilotRoverNode(Node):
         # SCALED_IMU zgyro is in mrad/s -> rad/s
         wz_meas = float(self.latest_scaled_imu.zgyro) / 1000.0
 
-        # -----------------------------
-        # Startup gyro bias calibration
-        # Keep robot still for a few seconds after launch
-        # -----------------------------
+        # Startup gyro bias calibration. Keep the robot still after launch.
         if not self.gyro_bias_ready:
             elapsed = (now - self.gyro_cal_start_time).nanoseconds / 1e9
 
@@ -650,28 +635,20 @@ class ArduPilotRoverNode(Node):
 
             self.get_logger().info(
                 f'Gyro bias calibration done: '
-                f'{self.gyro_bias_z:.6f} rad/s ({math.degrees(self.gyro_bias_z):.4f} deg/s)'
+                f'{self.gyro_bias_z:.6f} rad/s '
+                f'({math.degrees(self.gyro_bias_z):.4f} deg/s)'
             )
             return
 
-        # -----------------------------
-        # Integrate gyro z to get yaw
-        # -----------------------------
+        # For ROS yaw, we want left positive and right negative, so flip sign.
         wz_unbiased = wz_meas - self.gyro_bias_z
-
-        # Based on your test:
-        # right turn -> integrated yaw went positive
-        # left turn  -> integrated yaw went negative
-        # For ROS yaw, we want left positive and right negative, so flip sign here.
         delta_yaw = -(wz_unbiased * dt)
 
         yaw_old = self.last_yaw_ros
         yaw_mid = self.wrap_pi(yaw_old + 0.5 * delta_yaw)
         yaw_new = self.wrap_pi(yaw_old + delta_yaw)
 
-        groundspeed = self.last_cmd_linear * self.cmd_vel_scale
-
-        # Midpoint integration for Ackermann-like arcs
+        groundspeed = self.get_odom_groundspeed(now)
         self.odom_x += groundspeed * math.cos(yaw_mid) * dt
         self.odom_y += groundspeed * math.sin(yaw_mid) * dt
 
@@ -706,28 +683,27 @@ class ArduPilotRoverNode(Node):
         odom_msg.twist.twist.linear.x = groundspeed
         odom_msg.twist.twist.linear.y = 0.0
         odom_msg.twist.twist.linear.z = 0.0
-
         odom_msg.twist.twist.angular.x = 0.0
         odom_msg.twist.twist.angular.y = 0.0
         odom_msg.twist.twist.angular.z = delta_yaw / dt if dt > 0.0 else 0.0
 
         # Covariances: planar rover, approximate dead reckoning
         odom_msg.pose.covariance = [
-            0.15, 0.0,  0.0,    0.0,    0.0,    0.0,
-            0.0,  0.15, 0.0,    0.0,    0.0,    0.0,
-            0.0,  0.0,  9999.0, 0.0,    0.0,    0.0,
-            0.0,  0.0,  0.0,    9999.0, 0.0,    0.0,
-            0.0,  0.0,  0.0,    0.0,    9999.0, 0.0,
-            0.0,  0.0,  0.0,    0.0,    0.0,    0.4
+            0.15, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.15, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 9999.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 9999.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 9999.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.4
         ]
 
         odom_msg.twist.covariance = [
-            0.20, 0.0,  0.0,    0.0,    0.0,    0.0,
-            0.0,  0.20, 0.0,    0.0,    0.0,    0.0,
-            0.0,  0.0,  9999.0, 0.0,    0.0,    0.0,
-            0.0,  0.0,  0.0,    9999.0, 0.0,    0.0,
-            0.0,  0.0,  0.0,    0.0,    9999.0, 0.0,
-            0.0,  0.0,  0.0,    0.0,    0.0,    0.3
+            0.20, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.20, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 9999.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 9999.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 9999.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.3
         ]
 
         self.odom_pub.publish(odom_msg)
@@ -736,17 +712,15 @@ class ArduPilotRoverNode(Node):
         tf_msg.header.stamp = stamp
         tf_msg.header.frame_id = self.odom_frame
         tf_msg.child_frame_id = self.base_frame
-
         tf_msg.transform.translation.x = self.odom_x
         tf_msg.transform.translation.y = self.odom_y
         tf_msg.transform.translation.z = 0.0
-
         tf_msg.transform.rotation.x = float(quat[0])
         tf_msg.transform.rotation.y = float(quat[1])
         tf_msg.transform.rotation.z = float(quat[2])
         tf_msg.transform.rotation.w = float(quat[3])
-
         self.tf_broadcaster.sendTransform(tf_msg)
+
 
 
     def status_loop(self):
