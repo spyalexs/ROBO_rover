@@ -571,7 +571,9 @@ class ArduPilotRoverNode(Node):
             if time.time() - self.last_cmd_time > self.cmd_timeout:
                 return 0.0
             if self.manaual_rate_mapping and self.ol_model_loaded:
-                return self.cmd_vel_scale * float(self.current_ol_velocity)
+                # Use the steady-state lookup directly for odom so it has no lag.
+                # Flip the sign here to match the ROS forward-positive convention.
+                return -self.cmd_vel_scale * float(self.get_velocity_ol_steady_state())
             if not self.ol_model_loaded and not self.ol_model_warned:
                 self.get_logger().warn(
                     'Open-loop odom model is not loaded; manual-mode odom speed is 0'
