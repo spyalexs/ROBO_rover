@@ -62,6 +62,7 @@ class ArduPilotRoverNode(Node):
         self.declare_parameter('imu_stale_timeout', 0.20)
         self.declare_parameter('debug_gyro_yaw', False)
         self.declare_parameter('cmd_vel_scale', 1.0)
+        self.declare_parameter('odom_without_imu', True)
 
         # Get parameters
         self.connection_string = self.get_parameter('connection_string').value
@@ -78,6 +79,7 @@ class ArduPilotRoverNode(Node):
         self.imu_stale_timeout = float(self.get_parameter('imu_stale_timeout').value)
         self.debug_gyro_yaw = bool(self.get_parameter('debug_gyro_yaw').value)
         self.cmd_vel_scale = float(self.get_parameter('cmd_vel_scale').value)
+        self.odom_without_imu = bool(self.get_parameter('odom_without_imu').value)
 
         # Control variables
         self.default_throttle = 0.0
@@ -108,6 +110,8 @@ class ArduPilotRoverNode(Node):
         self.last_odom_update_time = None
         self.last_yaw_ros = 0.0
         self.last_groundspeed = 0.0
+        self.odom_imu_fallback_logged = False
+        self.ol_model_warned = False
 
         # Gyro-integrated yaw state
         self.gyro_bias_z = 0.0         # rad/s
@@ -181,8 +185,8 @@ class ArduPilotRoverNode(Node):
         with open(ol_path, "r") as file:
             try:
                 model_raw = yaml.safe_load(file)
-            except Exception:
-                self.get_logger().error("Failed to open ol model!")
+            except Exception as e:
+                self.get_logger().error(f"Failed to open ol model {ol_path}: {e}")
                 return
 
         self.ol_model = SimpleNamespace()
@@ -199,6 +203,7 @@ class ArduPilotRoverNode(Node):
         self.ol_model.steering.pwms = np.array(model_raw["angular"]["pwm_values"])
 
         self.ol_model_loaded = True
+        self.get_logger().info(f"Loaded open-loop odom model from {ol_path}")
 
     def connect_to_rover(self):
         """Connect to the rover via MAVLink"""
@@ -566,17 +571,22 @@ class ArduPilotRoverNode(Node):
             if time.time() - self.last_cmd_time > self.cmd_timeout:
                 return 0.0
             if self.manaual_rate_mapping and self.ol_model_loaded:
-                return float(self.current_ol_velocity)
+                return self.cmd_vel_scale * float(self.current_ol_velocity)
+            if not self.ol_model_loaded and not self.ol_model_warned:
+                self.get_logger().warn(
+                    'Open-loop odom model is not loaded; manual-mode odom speed is 0'
+                )
+                self.ol_model_warned = True
             return 0.0
 
         cmd_age = (now - self.last_cmd_time_ros).nanoseconds / 1e9
         if cmd_age > self.cmd_timeout:
             return 0.0
-        return float(self.last_cmd_linear)
+        return self.cmd_vel_scale * float(self.last_cmd_linear)
 
     def odom_loop(self):
         """Publish dead-reckoned odometry using integrated SCALED_IMU z-gyro"""
-        if not self.connected or self.latest_scaled_imu is None:
+        if not self.connected:
             return
 
         now = self.get_clock().now()
@@ -593,56 +603,70 @@ class ArduPilotRoverNode(Node):
         if dt <= 0.0 or dt > 1.0:
             return
 
-        if self.latest_scaled_imu_ros_time is None:
-            return
+        imu_fresh = False
+        if (
+            self.latest_scaled_imu is not None
+            and self.latest_scaled_imu_ros_time is not None
+        ):
+            imu_age = (now - self.latest_scaled_imu_ros_time).nanoseconds / 1e9
+            imu_fresh = imu_age <= self.imu_stale_timeout
 
-        imu_age = (now - self.latest_scaled_imu_ros_time).nanoseconds / 1e9
-        if imu_age > self.imu_stale_timeout:
-            self.get_logger().warn(
-                f'SCALED_IMU stale ({imu_age:.3f}s old); skipping odom update once'
-            )
-            return
+        if imu_fresh:
+            self.odom_imu_fallback_logged = False
+            # SCALED_IMU zgyro is in mrad/s -> rad/s
+            wz_meas = float(self.latest_scaled_imu.zgyro) / 1000.0
 
-        # SCALED_IMU zgyro is in mrad/s -> rad/s
-        wz_meas = float(self.latest_scaled_imu.zgyro) / 1000.0
+            # Startup gyro bias calibration. Keep the robot still after launch.
+            if not self.gyro_bias_ready:
+                elapsed = (now - self.gyro_cal_start_time).nanoseconds / 1e9
 
-        # Startup gyro bias calibration. Keep the robot still after launch.
-        if not self.gyro_bias_ready:
-            elapsed = (now - self.gyro_cal_start_time).nanoseconds / 1e9
+                if elapsed < self.gyro_cal_duration:
+                    self.gyro_bias_sum += wz_meas
+                    self.gyro_bias_count += 1
 
-            if elapsed < self.gyro_cal_duration:
-                self.gyro_bias_sum += wz_meas
-                self.gyro_bias_count += 1
+                    if not self.yaw_initialized:
+                        self.last_yaw_ros = 0.0
+                        self.yaw_initialized = True
 
-                if not self.yaw_initialized:
-                    self.last_yaw_ros = 0.0
-                    self.yaw_initialized = True
+                    self.get_logger().info(
+                        f'Calibrating gyro bias... keep robot still '
+                        f'({elapsed:.1f}/{self.gyro_cal_duration:.1f}s)'
+                    )
+                    return
+
+                if self.gyro_bias_count > 0:
+                    self.gyro_bias_z = self.gyro_bias_sum / self.gyro_bias_count
+                else:
+                    self.gyro_bias_z = 0.0
+
+                self.gyro_bias_ready = True
+                self.last_yaw_ros = 0.0
+                self.yaw_initialized = True
 
                 self.get_logger().info(
-                    f'Calibrating gyro bias... keep robot still '
-                    f'({elapsed:.1f}/{self.gyro_cal_duration:.1f}s)'
+                    f'Gyro bias calibration done: '
+                    f'{self.gyro_bias_z:.6f} rad/s '
+                    f'({math.degrees(self.gyro_bias_z):.4f} deg/s)'
                 )
                 return
 
-            if self.gyro_bias_count > 0:
-                self.gyro_bias_z = self.gyro_bias_sum / self.gyro_bias_count
-            else:
-                self.gyro_bias_z = 0.0
-
-            self.gyro_bias_ready = True
-            self.last_yaw_ros = 0.0
-            self.yaw_initialized = True
-
-            self.get_logger().info(
-                f'Gyro bias calibration done: '
-                f'{self.gyro_bias_z:.6f} rad/s '
-                f'({math.degrees(self.gyro_bias_z):.4f} deg/s)'
-            )
-            return
-
-        # For ROS yaw, we want left positive and right negative, so flip sign.
-        wz_unbiased = wz_meas - self.gyro_bias_z
-        delta_yaw = -(wz_unbiased * dt)
+            # For ROS yaw, we want left positive and right negative, so flip sign.
+            wz_unbiased = wz_meas - self.gyro_bias_z
+            delta_yaw = -(wz_unbiased * dt)
+        else:
+            if not self.odom_without_imu:
+                return
+            if not self.yaw_initialized:
+                self.last_yaw_ros = 0.0
+                self.yaw_initialized = True
+            if not self.odom_imu_fallback_logged:
+                self.get_logger().warn(
+                    'No fresh SCALED_IMU; odom is integrating commanded speed '
+                    'with yaw held constant'
+                )
+                self.odom_imu_fallback_logged = True
+            wz_unbiased = 0.0
+            delta_yaw = 0.0
 
         yaw_old = self.last_yaw_ros
         yaw_mid = self.wrap_pi(yaw_old + 0.5 * delta_yaw)
@@ -737,6 +761,16 @@ class ArduPilotRoverNode(Node):
 
     def param_cb(self):
         # callback for handling changed robo rover parameters
+        self.cmd_timeout = float(self.get_parameter('cmd_timeout').value)
+        self.imu_stale_timeout = float(
+            self.get_parameter('imu_stale_timeout').value
+        )
+        self.debug_gyro_yaw = bool(self.get_parameter('debug_gyro_yaw').value)
+        self.cmd_vel_scale = float(self.get_parameter('cmd_vel_scale').value)
+        self.odom_without_imu = bool(
+            self.get_parameter('odom_without_imu').value
+        )
+
         if self.is_manual != self.get_parameter('manual_mode').value:
             # make sure these are neutral before changing modes
             self.set_servo_pwm(3, NEUTRAL_PWM)
