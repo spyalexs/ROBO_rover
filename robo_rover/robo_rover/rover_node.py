@@ -52,7 +52,7 @@ class ArduPilotRoverNode(Node):
         self.declare_parameter('baud_rate', 115200)
         self.declare_parameter('control_frequency', 20.0)
         self.declare_parameter('imu_frequency', 20.0)
-        self.declare_parameter('manual_mode', False)
+        self.declare_parameter('manual_mode', True)
         self.declare_parameter('ol_rate_mapping', True)
         self.declare_parameter('odom_frequency', 20.0)
         self.declare_parameter('cmd_timeout', 1.0)
