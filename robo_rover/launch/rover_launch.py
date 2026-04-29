@@ -43,7 +43,13 @@ def generate_launch_description():
         default_value='',
         description='Namespace for the rover node'
     )
-    
+
+    accel_scale_arg = DeclareLaunchArgument(
+        'cmd_vel_scale',
+        default_value='1.0',
+        description='Scale factor applied to commanded velocity for odometry'
+    )
+
     # Rover node
     rover_node = Node(
         executable='python3',
@@ -57,6 +63,7 @@ def generate_launch_description():
             'baud_rate': LaunchConfiguration('baud_rate'),
             'control_frequency': LaunchConfiguration('control_frequency'),
             'imu_frequency': LaunchConfiguration('imu_frequency'),
+            'cmd_vel_scale': LaunchConfiguration('cmd_vel_scale'),
         }],
     )
 
@@ -77,6 +84,7 @@ def generate_launch_description():
         control_frequency_arg,
         imu_frequency_arg,
         namespace_arg,
+        accel_scale_arg,
         log_info,
         rover_node,
 
